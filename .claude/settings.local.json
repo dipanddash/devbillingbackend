@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs grep:*)",
+      "Bash(xargs ls:*)",
+      "Bash(python manage.py makemigrations sync)",
+      "Bash(npx tsc:*)",
+      "Bash(npx vite:*)",
+      "Bash(python manage.py migrate sync)"
+    ]
+  }
+}

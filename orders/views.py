@@ -336,7 +336,16 @@ class CouponValidateView(APIView):
                 return error_response("Coupon valid only for first-time users", 400)
 
         discount_amount = _compute_coupon_discount(coupon, order_amount)
-        if discount_amount <= 0:
+        if coupon.discount_type == "FREE_ITEM":
+            if order_amount < (coupon.min_order_amount or Decimal("0")):
+                return error_response(
+                    "Order does not meet minimum amount for this coupon",
+                    400,
+                    {"min_order_amount": coupon.min_order_amount},
+                )
+            # FREE_ITEM coupon is valid even when monetary discount is zero.
+            discount_amount = Decimal("0.00")
+        elif discount_amount <= 0:
             if order_amount < (coupon.min_order_amount or Decimal("0")):
                 return error_response(
                     "Order does not meet minimum amount for this coupon",
@@ -981,6 +990,8 @@ class OrderInvoiceView(APIView):
                 "discount_type": coupon_usage.coupon.discount_type if coupon_usage and coupon_usage.coupon else "",
                 "value": coupon_usage.coupon.value if coupon_usage and coupon_usage.coupon else Decimal("0.00"),
                 "discount_amount": coupon_discount,
+                "free_item": coupon_usage.coupon.free_item if coupon_usage and coupon_usage.coupon else "",
+                "free_item_category": coupon_usage.coupon.free_item_category if coupon_usage and coupon_usage.coupon else "",
             } if coupon_usage and coupon_usage.coupon else None,
             "discount_breakdown": {
                 "manual_discount": manual_discount,
@@ -1231,7 +1242,15 @@ class AddOrderItemsView(APIView):
                     return error_response("Coupon valid only for first-time users", 400, {"field": "coupon_code"})
 
             coupon_discount_amount = _compute_coupon_discount(coupon_obj, total)
-            if coupon_discount_amount <= 0:
+            if coupon_obj.discount_type == "FREE_ITEM":
+                if total < (coupon_obj.min_order_amount or Decimal("0")):
+                    return error_response(
+                        "Order does not meet minimum amount for this coupon",
+                        400,
+                        {"field": "coupon_code", "min_order_amount": coupon_obj.min_order_amount},
+                    )
+                coupon_discount_amount = Decimal("0.00")
+            elif coupon_discount_amount <= 0:
                 if total < (coupon_obj.min_order_amount or Decimal("0")):
                     return error_response(
                         "Order does not meet minimum amount for this coupon",
@@ -1560,6 +1579,10 @@ class OrderDetailView(generics.RetrieveAPIView):
         "table",
         "session",
         "customer"
+    ).prefetch_related(
+        "items__product",
+        "items__combo",
+        "items__addons__addon",
     )
 
     serializer_class = OrderDetailSerializer

@@ -486,6 +486,51 @@ class OrderListSerializer(serializers.ModelSerializer):
             return Decimal("0.00")
         return obj.total_amount or Decimal("0.00")
         
+class OrderDetailAddonSerializer(serializers.ModelSerializer):
+    addon_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = OrderItemAddon
+        fields = ["addon", "addon_name", "price_at_time"]
+
+    def get_addon_name(self, obj):
+        if obj.addon:
+            return obj.addon.name
+        return ""
+
+
+class OrderDetailItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.SerializerMethodField()
+    combo_name = serializers.SerializerMethodField()
+    addons = OrderDetailAddonSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = OrderItem
+        fields = [
+            "id",
+            "product",
+            "combo",
+            "product_name",
+            "combo_name",
+            "quantity",
+            "base_price",
+            "gst_percent",
+            "gst_amount",
+            "price_at_time",
+            "addons",
+        ]
+
+    def get_product_name(self, obj):
+        if obj.product:
+            return obj.product.name
+        return ""
+
+    def get_combo_name(self, obj):
+        if obj.combo:
+            return obj.combo.name
+        return ""
+
+
 class OrderDetailSerializer(serializers.ModelSerializer):
 
     table_number = serializers.CharField(
@@ -502,6 +547,7 @@ class OrderDetailSerializer(serializers.ModelSerializer):
     customer_name = serializers.CharField(read_only=True)
     customer_phone = serializers.CharField(read_only=True)
     order_id = serializers.SerializerMethodField()
+    items = OrderDetailItemSerializer(many=True, read_only=True)
 
     class Meta:
         model = Order
@@ -522,6 +568,7 @@ class OrderDetailSerializer(serializers.ModelSerializer):
 
             "created_at",
             "total_amount",
+            "items",
         ]
 
     def get_order_id(self, obj):

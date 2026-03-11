@@ -765,33 +765,27 @@ def _report_simple(request, report_key):
         return [{"rows": len(rows)}], rows, []
     if report_key == "staff-attendance":
         start, end = _resolve_date_range(request)
-        logs = _apply_date(StaffSessionLog.objects.filter(user__role="STAFF").select_related("user"), "login_at__date", start, end)
-        grouped = defaultdict(list)
-        for log in logs:
-            day = timezone.localtime(log.login_at).date().isoformat()
-            grouped[(log.user.username, day)].append(log)
+        logs = _apply_date(
+            StaffSessionLog.objects.filter(user__role="STAFF").select_related("user"),
+            "login_at__date",
+            start,
+            end,
+        ).order_by("-login_at")
         rows = []
-        for (name, day), entries in grouped.items():
-            cin = min(timezone.localtime(e.login_at) for e in entries)
-            couts = [timezone.localtime(e.logout_at) for e in entries if e.logout_at]
-            cout = max(couts) if couts else None
+        for log in logs:
+            login_at = timezone.localtime(log.login_at)
+            logout_at = timezone.localtime(log.logout_at) if log.logout_at else None
             worked_seconds = 0
-            for entry in entries:
-                if not entry.logout_at:
-                    continue
-                login_at = timezone.localtime(entry.login_at)
-                logout_at = timezone.localtime(entry.logout_at)
-                if logout_at > login_at:
-                    worked_seconds += int((logout_at - login_at).total_seconds())
-            hrs = worked_seconds / 3600
+            if logout_at and logout_at > login_at:
+                worked_seconds = int((logout_at - login_at).total_seconds())
             rows.append({
-                "staff_name": name,
+                "staff_name": log.user.username,
                 "role": "STAFF",
-                "date": day,
-                "check_in": cin.strftime("%H:%M:%S"),
-                "check_out": cout.strftime("%H:%M:%S") if cout else "-",
-                "total_hours": round(hrs, 2),
-                "status": "Present" if cout else "Active",
+                "date": login_at.date().isoformat(),
+                "check_in": login_at.strftime("%H:%M:%S"),
+                "check_out": logout_at.strftime("%H:%M:%S") if logout_at else None,
+                "total_hours": round(worked_seconds / 3600, 2),
+                "status": "Present" if logout_at else "Active",
             })
         return [{"rows": len(rows)}], rows, []
     if report_key == "staff-login":
@@ -799,6 +793,8 @@ def _report_simple(request, report_key):
         logs = _apply_date(StaffSessionLog.objects.filter(user__role="STAFF").select_related("user"), "login_at__date", start, end).order_by("-login_at")
         rows = [{
             "staff_name": l.user.username,
+            "punch_in": timezone.localtime(l.login_at).isoformat(),
+            "punch_out": timezone.localtime(l.logout_at).isoformat() if l.logout_at else "-",
             "login_time": timezone.localtime(l.login_at).isoformat(),
             "logout_time": timezone.localtime(l.logout_at).isoformat() if l.logout_at else "-",
             "duration": round(((timezone.localtime(l.logout_at) - timezone.localtime(l.login_at)).total_seconds() / 3600), 2) if l.logout_at else 0,

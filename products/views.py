@@ -1,3 +1,6 @@
+import uuid as uuid_mod
+
+from django.db import DatabaseError, OperationalError
 from rest_framework import generics, status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser
@@ -16,28 +19,114 @@ from .serializers import (
     ComboWithItemsSerializer,
 )
 from rest_framework.parsers import JSONParser
+from cafe_billing_backend.connectivity import is_neon_reachable
+from sync.models import OfflineSyncQueue
+
+
+class SQLiteFallbackQuerysetMixin:
+    """
+    Read from Neon when available, but automatically fall back to SQLite if
+    Neon drops or returns a database-level error during the request.
+    """
+
+    sqlite_fallback_enabled = True
+    _forced_read_alias = None
+
+    def should_prefer_sqlite(self):
+        pending_catalog_statuses = ("PENDING", "IN_PROGRESS", "FAILED")
+        return OfflineSyncQueue.objects.using("sqlite").filter(
+            entity_type__in=("category", "product", "addon", "combo"),
+            action="create",
+            status__in=pending_catalog_statuses,
+        ).exists()
+
+    def get_queryset_for_alias(self, alias):
+        queryset = super().get_queryset()
+        return queryset.using(alias)
+
+    def get_queryset(self):
+        alias = self._forced_read_alias or (
+            "sqlite"
+            if self.should_prefer_sqlite()
+            else ("neon" if is_neon_reachable(force=True) else "sqlite")
+        )
+        return self.get_queryset_for_alias(alias)
+
+    def list(self, request, *args, **kwargs):
+        try:
+            return super().list(request, *args, **kwargs)
+        except (OperationalError, DatabaseError):
+            if not self.sqlite_fallback_enabled:
+                raise
+            queryset = self.filter_queryset(self.get_queryset_for_alias("sqlite"))
+            page = self.paginate_queryset(queryset)
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
+            serializer = self.get_serializer(queryset, many=True)
+            return Response(serializer.data)
+
+    def retrieve(self, request, *args, **kwargs):
+        try:
+            return super().retrieve(request, *args, **kwargs)
+        except (OperationalError, DatabaseError):
+            if not self.sqlite_fallback_enabled:
+                raise
+            self._forced_read_alias = "sqlite"
+            try:
+                return super().retrieve(request, *args, **kwargs)
+            finally:
+                self._forced_read_alias = None
+
+
+def _enqueue_catalog_create(entity_type, payload, entity_id):
+    client_id = uuid_mod.uuid5(
+        uuid_mod.NAMESPACE_URL,
+        f"offline-catalog:{entity_type}:create:{entity_id}",
+    )
+    if OfflineSyncQueue.objects.using("sqlite").filter(client_id=client_id).exists():
+        return
+    OfflineSyncQueue.objects.using("sqlite").create(
+        client_id=client_id,
+        entity_type=entity_type,
+        action="create",
+        payload=payload,
+    )
 
 # ----------------------------
 # CATEGORY
 # ----------------------------
 
-class CategoryListCreateView(generics.ListCreateAPIView):
+class CategoryListCreateView(SQLiteFallbackQuerysetMixin, generics.ListCreateAPIView):
 
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
-    parser_classes = [MultiPartParser, FormParser]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_permissions(self):
         if self.request.method == "POST":
             return [IsAdminRole()]
         return [IsAuthenticated()]
 
+    def perform_create(self, serializer):
+        category = serializer.save()
+        if is_neon_reachable(force=True):
+            return
+        _enqueue_catalog_create(
+            "category",
+            {
+                "id": str(category.id),
+                "name": category.name,
+            },
+            category.id,
+        )
 
-class CategoryRetrieveUpdateDeleteView(generics.RetrieveUpdateDestroyAPIView):
+
+class CategoryRetrieveUpdateDeleteView(SQLiteFallbackQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
 
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
-    parser_classes = [MultiPartParser, FormParser]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_permissions(self):
         if self.request.method in ["PUT", "PATCH", "DELETE"]:
@@ -58,11 +147,11 @@ class CategoryRetrieveUpdateDeleteView(generics.RetrieveUpdateDestroyAPIView):
 # PRODUCT
 # ----------------------------
 
-class ProductListCreateView(generics.ListCreateAPIView):
+class ProductListCreateView(SQLiteFallbackQuerysetMixin, generics.ListCreateAPIView):
 
     queryset = Product.objects.filter(is_active=True).select_related("category").prefetch_related("recipes__ingredient")
     serializer_class = ProductSerializer
-    parser_classes = [MultiPartParser, FormParser]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_permissions(self):
         if self.request.method == "POST":
@@ -70,36 +159,64 @@ class ProductListCreateView(generics.ListCreateAPIView):
         return [IsAdminOrStaff()]
 
     def perform_create(self, serializer):
-        serializer.save(is_active=True)
+        product = serializer.save(is_active=True)
+        if is_neon_reachable(force=True):
+            return
+        _enqueue_catalog_create(
+            "product",
+            {
+                "id": str(product.id),
+                "name": product.name,
+                "category_id": str(product.category_id),
+                "price": str(product.price),
+                "gst_percent": str(product.gst_percent),
+                "is_active": bool(product.is_active),
+            },
+            product.id,
+        )
 
 
-class ProductUpdateView(generics.RetrieveUpdateDestroyAPIView):
+class ProductUpdateView(SQLiteFallbackQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
 
     queryset = Product.objects.all()
     serializer_class = ProductSerializer
-    parser_classes = [MultiPartParser, FormParser]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
     permission_classes = [IsAdminRole]
 
 # ----------------------------
 # ADDON
 # ----------------------------
 
-class AddonListCreateView(generics.ListCreateAPIView):
+class AddonListCreateView(SQLiteFallbackQuerysetMixin, generics.ListCreateAPIView):
 
     queryset = Addon.objects.all()
     serializer_class = AddonSerializer
-    parser_classes = [MultiPartParser, FormParser]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_permissions(self):
         if self.request.method == "POST":
             return [IsAdminRole()]
         return [IsAuthenticated()]
 
+    def perform_create(self, serializer):
+        addon = serializer.save()
+        if is_neon_reachable(force=True):
+            return
+        _enqueue_catalog_create(
+            "addon",
+            {
+                "id": str(addon.id),
+                "name": addon.name,
+                "price": str(addon.price),
+            },
+            addon.id,
+        )
+
 # ----------------------------
 # COMBO
 # ----------------------------
 
-class ComboListCreateView(generics.ListCreateAPIView):
+class ComboListCreateView(SQLiteFallbackQuerysetMixin, generics.ListCreateAPIView):
 
     queryset = Combo.objects.filter(is_active=True).prefetch_related("items__product__recipes__ingredient")
     parser_classes = [MultiPartParser, FormParser, JSONParser]
@@ -114,19 +231,44 @@ class ComboListCreateView(generics.ListCreateAPIView):
             return ComboWithItemsSerializer
         return ComboSerializer
 
+    def perform_create(self, serializer):
+        combo = serializer.save()
+        if is_neon_reachable(force=True):
+            return
 
-class AddonRetrieveUpdateDeleteView(generics.RetrieveUpdateDestroyAPIView):
+        items_payload = [
+            {
+                "product_id": str(row.product_id),
+                "quantity": int(row.quantity),
+            }
+            for row in combo.items.all()
+        ]
+        _enqueue_catalog_create(
+            "combo",
+            {
+                "id": str(combo.id),
+                "name": combo.name,
+                "price": str(combo.price),
+                "gst_percent": str(combo.gst_percent),
+                "is_active": bool(combo.is_active),
+                "items": items_payload,
+            },
+            combo.id,
+        )
+
+
+class AddonRetrieveUpdateDeleteView(SQLiteFallbackQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
 
     queryset = Addon.objects.all()
     serializer_class = AddonSerializer
-    parser_classes = [MultiPartParser, FormParser]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_permissions(self):
         if self.request.method in ["PUT", "PATCH", "DELETE"]:
             return [IsAdminRole()]
         return [IsAuthenticated()]
 
-class ComboRetrieveUpdateDeleteView(generics.RetrieveUpdateDestroyAPIView):
+class ComboRetrieveUpdateDeleteView(SQLiteFallbackQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
 
     queryset = Combo.objects.all().prefetch_related("items__product__recipes__ingredient")
     parser_classes = [MultiPartParser, FormParser, JSONParser]
@@ -142,13 +284,14 @@ class ComboRetrieveUpdateDeleteView(generics.RetrieveUpdateDestroyAPIView):
         return ComboSerializer
 
 
-class ComboItemListCreateView(generics.ListCreateAPIView):
+class ComboItemListCreateView(SQLiteFallbackQuerysetMixin, generics.ListCreateAPIView):
 
     serializer_class = ComboItemSerializer
     parser_classes = [JSONParser]
+    queryset = ComboItem.objects.select_related("combo", "product").all()
 
-    def get_queryset(self):
-        queryset = ComboItem.objects.select_related("combo", "product").all()
+    def get_queryset_for_alias(self, alias):
+        queryset = self.queryset.using(alias)
         combo_id = self.request.query_params.get("combo")
         if combo_id:
             queryset = queryset.filter(combo_id=combo_id)
@@ -160,7 +303,7 @@ class ComboItemListCreateView(generics.ListCreateAPIView):
         return [IsAuthenticated()]
 
 
-class ComboItemRetrieveUpdateDeleteView(generics.RetrieveUpdateDestroyAPIView):
+class ComboItemRetrieveUpdateDeleteView(SQLiteFallbackQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
 
     queryset = ComboItem.objects.select_related("combo", "product").all()
     serializer_class = ComboItemSerializer
@@ -176,21 +319,19 @@ class ComboItemRetrieveUpdateDeleteView(generics.RetrieveUpdateDestroyAPIView):
 # RECIPE
 # ----------------------------
 
-class RecipeListCreateView(generics.ListCreateAPIView):
+class RecipeListCreateView(SQLiteFallbackQuerysetMixin, generics.ListCreateAPIView):
 
+    queryset = Recipe.objects.select_related("product", "ingredient")
     serializer_class = RecipeSerializer
 
-    def get_queryset(self):
-        queryset = Recipe.objects.select_related("product", "ingredient")
-
+    def get_queryset_for_alias(self, alias):
+        queryset = self.queryset.using(alias)
         product_id = self.request.query_params.get("product")
-
         if product_id:
             queryset = queryset.filter(product_id=product_id)
-
         return queryset
 
-class RecipeUpdateDeleteView(generics.RetrieveUpdateDestroyAPIView):
+class RecipeUpdateDeleteView(SQLiteFallbackQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
 
     queryset = Recipe.objects.select_related("product", "ingredient")
     serializer_class = RecipeSerializer

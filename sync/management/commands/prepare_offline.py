@@ -17,6 +17,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         self._migrate_sqlite()
         self._cache_credentials()
+        self._refresh_local_mirror()
         self.stdout.write(self.style.SUCCESS("Offline database is ready."))
 
     def _migrate_sqlite(self):
@@ -29,7 +30,7 @@ class Command(BaseCommand):
         from accounts.models import User
         from sync.offline_auth import cache_user_credentials
 
-        users = User.objects.filter(is_active=True)
+        users = User.objects.using("neon").filter(is_active=True)
         count = 0
         for user in users:
             try:
@@ -39,3 +40,24 @@ class Command(BaseCommand):
                 self.stderr.write(f"  Could not cache {user.username}: {exc}")
 
         self.stdout.write(f"Cached credentials for {count} active user(s).")
+
+    def _refresh_local_mirror(self):
+        from sync.sync_service import refresh_sqlite_from_neon
+
+        self.stdout.write("Refreshing local SQLite mirror from Neon...")
+        result = refresh_sqlite_from_neon()
+        status = result.get("status")
+        if status == "offline":
+            self.stderr.write("Neon is unreachable, skipped mirror refresh.")
+            return
+
+        refreshed = result.get("refreshed", {})
+        summary = ", ".join(f"{name}={count}" for name, count in refreshed.items())
+        if status == "ok":
+            self.stdout.write(f"Mirrored data: {summary}")
+            return
+
+        failed = result.get("failed", {})
+        self.stdout.write(f"Mirrored data (partial): {summary}")
+        if failed:
+            self.stderr.write("Mirror failed for: " + ", ".join(failed.keys()))

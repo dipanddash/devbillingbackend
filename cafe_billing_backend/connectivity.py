@@ -1,22 +1,46 @@
 """
 Network connectivity checker for Neon PostgreSQL fallback.
-Provides a cached check so repeated calls don't hammer the network.
+Provides a cached database-level check so repeated calls do not hammer Neon.
 """
 
 import logging
-import os
-import socket
 import time
+
+from django.db import DatabaseError, InterfaceError, OperationalError, close_old_connections, connections
 
 logger = logging.getLogger(__name__)
 
 _cache = {"online": None, "checked_at": 0}
-CACHE_TTL = 30  # seconds
+CACHE_TTL = 15  # seconds
+
+
+def _probe_neon_database():
+    """
+    Verify Neon with a real SQL round-trip instead of only a TCP socket probe.
+    This avoids false "online" states when the socket opens but queries fail.
+    """
+    close_old_connections()
+    connection = connections["neon"]
+
+    # If Django is holding a psycopg connection object that's already closed,
+    # reset it before opening a cursor so the probe can reconnect cleanly.
+    raw_connection = getattr(connection, "connection", None)
+    if raw_connection is not None and getattr(raw_connection, "closed", 0):
+        connection.close()
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            row = cursor.fetchone()
+            return bool(row and row[0] == 1)
+    except (OperationalError, DatabaseError, InterfaceError, OSError):
+        connection.close()
+        raise
 
 
 def is_neon_reachable(force=False):
     """
-    Quick TCP socket check to the Neon PostgreSQL host.
+    Database-level health check for Neon PostgreSQL.
     Results are cached for CACHE_TTL seconds to avoid repeated checks.
     """
     now = time.time()
@@ -27,21 +51,12 @@ def is_neon_reachable(force=False):
     ):
         return _cache["online"]
 
-    host = os.getenv("DB_HOST", "")
-    port = int(os.getenv("DB_PORT", "5432"))
-    timeout = min(int(os.getenv("DB_CONNECT_TIMEOUT", "5")), 5)
-
-    if not host:
-        _cache.update({"online": False, "checked_at": now})
-        return False
-
     try:
-        sock = socket.create_connection((host, port), timeout=timeout)
-        sock.close()
+        _probe_neon_database()
         _cache.update({"online": True, "checked_at": now})
         logger.debug("Neon PostgreSQL is reachable.")
         return True
-    except (socket.timeout, socket.error, OSError):
+    except (OperationalError, DatabaseError, InterfaceError, OSError):
         _cache.update({"online": False, "checked_at": now})
-        logger.info("Neon PostgreSQL is unreachable — offline mode.")
+        logger.info("Neon PostgreSQL is unreachable - offline mode.")
         return False

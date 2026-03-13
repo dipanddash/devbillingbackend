@@ -1,11 +1,12 @@
 import uuid
+from uuid import uuid4
 from rest_framework.views import APIView
 from rest_framework import generics
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import ValidationError
-from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from django.contrib.auth import authenticate
 from django.utils import timezone
 from datetime import datetime
@@ -17,6 +18,7 @@ from .serializers import (
     LoginSerializer,
     CustomerSerializer,
     CustomTokenObtainPairSerializer,
+    CustomTokenRefreshSerializer,
     StaffUserSerializer,
     AdminUserSerializer,
     MeProfileSerializer,
@@ -26,13 +28,12 @@ from .serializers import (
 from .permissions import IsAdminRole
 from .models import Customer, StaffReportAccess, StaffSessionLog, User
 from inventory.models import DailyStockSnapshot, ManualClosing
+from cafe_billing_backend.connectivity import is_neon_reachable
 
 class LoginView(APIView):
     def post(self, request):
-        from django.conf import settings as django_settings
-
         # Offline mode: authenticate against locally cached credentials
-        if getattr(django_settings, "OFFLINE_MODE", False):
+        if not is_neon_reachable(force=True):
             from sync.offline_auth import authenticate_offline
 
             username = str(request.data.get("username", "")).strip()
@@ -63,10 +64,8 @@ class CustomTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
 
     def post(self, request, *args, **kwargs):
-        from django.conf import settings as django_settings
-
         # Offline mode: issue a simple token from cached credentials
-        if getattr(django_settings, "OFFLINE_MODE", False):
+        if not is_neon_reachable(force=True):
             from sync.offline_auth import authenticate_offline
             from rest_framework_simplejwt.tokens import RefreshToken
 
@@ -95,6 +94,10 @@ class CustomTokenObtainPairView(TokenObtainPairView):
 
         # Online mode: normal JWT flow
         return super().post(request, *args, **kwargs)
+
+
+class CustomTokenRefreshView(TokenRefreshView):
+    serializer_class = CustomTokenRefreshSerializer
 
 
 class LogoutView(APIView):
@@ -445,7 +448,29 @@ class StaffUserListCreateView(generics.ListCreateAPIView):
         return User.objects.filter(role__in=["STAFF", "SNOOKER_STAFF"]).order_by("username")
 
     def perform_create(self, serializer):
-        serializer.save()
+        staff_user = serializer.save()
+
+        if getattr(self.request, "is_offline", False) or not is_neon_reachable(force=False):
+            from sync.models import OfflineSyncQueue
+
+            OfflineSyncQueue.objects.using("sqlite").create(
+                client_id=uuid4(),
+                entity_type="staff",
+                action="create",
+                payload={
+                    "id": str(staff_user.id),
+                    "username": staff_user.username,
+                    "first_name": staff_user.first_name,
+                    "last_name": staff_user.last_name,
+                    "email": staff_user.email,
+                    "phone": staff_user.phone,
+                    "role": (staff_user.role or "").upper(),
+                    "is_active": bool(staff_user.is_active),
+                    "password_hash": staff_user.password,
+                    "is_staff": bool(staff_user.is_staff),
+                    "is_superuser": bool(staff_user.is_superuser),
+                },
+            )
 
 
 class StaffUserDetailView(generics.RetrieveUpdateDestroyAPIView):
@@ -579,7 +604,10 @@ class SystemResetView(APIView):
         from accounts.services import perform_system_reset
 
         try:
-            perform_system_reset(superuser_id=request.user.id)
+            neon_online = is_neon_reachable(force=True)
+            if neon_online:
+                perform_system_reset(superuser_id=request.user.id, using="neon")
+            perform_system_reset(superuser_id=request.user.id, using="sqlite")
         except Exception as e:
             return Response(
                 {"detail": f"System reset failed: {str(e)}"},
@@ -587,6 +615,10 @@ class SystemResetView(APIView):
             )
 
         return Response(
-            {"detail": "System reset complete. All data except your superuser account has been deleted."},
+            {
+                "detail": "System reset complete. All data except your superuser account has been deleted.",
+                "online_reset": neon_online,
+                "offline_reset": True,
+            },
             status=status.HTTP_200_OK,
         )

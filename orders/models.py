@@ -124,9 +124,10 @@ class Order(models.Model):
 
     def save(self, *args, **kwargs):
         if self.order_number is None:
-            with transaction.atomic():
+            using_db = kwargs.get("using") or self._state.db or "default"
+            with transaction.atomic(using=using_db):
                 last_order = (
-                    Order.objects
+                    Order.objects.using(using_db)
                     .select_for_update()
                     .exclude(order_number__isnull=True)
                     .order_by("-order_number")

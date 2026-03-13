@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 import json
 import logging
+import uuid as uuid_mod
 
 from django.conf import settings
 from django.db import transaction
@@ -25,6 +26,8 @@ from payments.models import Payment
 from inventory.models import StockLog, Ingredient
 from products.models import Product, Recipe, Combo, Addon
 from tables.models import TableSession
+from sync.models import OfflineSyncQueue
+from cafe_billing_backend.connectivity import is_neon_reachable
 
 from .models import Order, OrderItem, OrderItemAddon, Coupon, CouponUsage
 from .serializers import (
@@ -39,6 +42,15 @@ from .serializers import (
 from .utils import format_order_id, format_bill_number
 
 logger = logging.getLogger(__name__)
+
+
+def _refresh_sqlite_order_cache():
+    try:
+        from sync.sync_service import refresh_sqlite_from_neon
+
+        refresh_sqlite_from_neon()
+    except Exception:
+        logger.exception("Failed to refresh SQLite mirror after order mutation")
 
 
 def _parse_positive_quantity(value):
@@ -82,8 +94,13 @@ def _normalize_phone_number(phone):
 
 
 def send_fast2sms_whatsapp_message(phone, variables_values, message_id=None):
-    api_key = (getattr(settings, "FAST2SMS_API_KEY", "") or "").strip()
-    template_id = (message_id or getattr(settings, "FAST2SMS_WHATSAPP_TEMPLATE_ID", "") or "").strip()
+    api_key = str(getattr(settings, "FAST2SMS_API_KEY", "") or "").strip()
+    raw_template_id = (
+        message_id
+        if message_id not in (None, "")
+        else getattr(settings, "FAST2SMS_WHATSAPP_TEMPLATE_ID", "")
+    )
+    template_id = str(raw_template_id or "").strip()
     mobile_no = _normalize_phone_number(phone)
 
     if not api_key or not template_id or not mobile_no:
@@ -165,6 +182,60 @@ def send_order_invoice_whatsapp(order, bill_number, final_amount, method):
             result,
         )
     return result
+
+
+def _build_order_sync_payload(order, method, reference_id):
+    items_payload = []
+    order_items = (
+        order.items.select_related("product", "combo")
+        .prefetch_related("addons__addon")
+        .all()
+    )
+    for item in order_items:
+        addon_counts = defaultdict(int)
+        for addon_row in item.addons.all():
+            if addon_row.addon_id:
+                addon_counts[str(addon_row.addon_id)] += 1
+        addons = [{"id": addon_id, "quantity": qty} for addon_id, qty in addon_counts.items()]
+
+        row = {
+            "quantity": int(item.quantity),
+            "base_price": str(item.base_price),
+            "gst_percent": str(item.gst_percent),
+            "addons": addons,
+        }
+        if item.product_id:
+            row["product"] = str(item.product_id)
+        if item.combo_id:
+            row["combo"] = str(item.combo_id)
+        items_payload.append(row)
+
+    return {
+        "order_type": order.order_type,
+        "customer_name": order.customer_name or "",
+        "customer_phone": order.customer_phone or "",
+        "discount_amount": str(order.discount_amount or Decimal("0.00")),
+        "items": items_payload,
+        "payment": {
+            "method": method,
+            "reference": reference_id or "",
+        },
+        "staff_id": str(order.staff_id) if order.staff_id else None,
+    }
+
+
+def _enqueue_offline_paid_order(order, method, reference_id):
+    client_id = uuid_mod.uuid5(uuid_mod.NAMESPACE_URL, f"offline-order:{order.id}")
+    if OfflineSyncQueue.objects.using("sqlite").filter(client_id=client_id).exists():
+        return
+
+    payload = _build_order_sync_payload(order, method, reference_id)
+    OfflineSyncQueue.objects.using("sqlite").create(
+        client_id=client_id,
+        entity_type="order",
+        action="create",
+        payload=payload,
+    )
 
 
 def apply_order_filters(request, queryset):
@@ -461,6 +532,7 @@ class OrderStatusUpdateView(APIView):
 
         order.status = next_status
         order.save(update_fields=["status"])
+        transaction.on_commit(_refresh_sqlite_order_cache)
         return Response({"id": str(order.id), "status": order.status}, status=200)
 
 
@@ -611,6 +683,7 @@ class OrderPaymentView(APIView):
         method = request.data.get("method")
         reference = (request.data.get("reference") or "").strip()
         cash_received_raw = request.data.get("cash_received")
+        request_is_offline = bool(getattr(request, "is_offline", not is_neon_reachable(force=False)))
 
         # -------------------------
         # Validate Method
@@ -837,6 +910,15 @@ class OrderPaymentView(APIView):
                         method=method,
                     )
                 )
+                if request_is_offline:
+                    transaction.on_commit(
+                        lambda: _enqueue_offline_paid_order(
+                            order=order,
+                            method=method,
+                            reference_id=reference_id,
+                        )
+                    )
+                transaction.on_commit(_refresh_sqlite_order_cache)
         except ValidationError as exc:
             detail = getattr(exc, "detail", exc)
             if isinstance(detail, (list, tuple)) and detail:
@@ -1331,6 +1413,7 @@ class AddOrderItemsView(APIView):
                 )
             else:
                 order.coupon_usages.all().delete()
+            transaction.on_commit(_refresh_sqlite_order_cache)
 
         return Response(
             {
@@ -1459,6 +1542,7 @@ class OrderCreateView(APIView):
 
             staff=request.user
         )
+        transaction.on_commit(_refresh_sqlite_order_cache)
 
         return Response(
             {
@@ -1547,17 +1631,24 @@ class RecentOrderListView(APIView):
 def send_whatsapp(request):
     if request.method == "POST":
         try:
-            data = json.loads(request.body)
+            data = json.loads(request.body or "{}")
         except json.JSONDecodeError:
             return JsonResponse({"error": "Invalid JSON body"}, status=400)
 
-        phone = data.get("phone")
-        vars_list = data.get("variables") or []
-        if not isinstance(vars_list, list):
-            return JsonResponse({"error": "variables must be a list"}, status=400)
+        phone = data.get("phone") or data.get("mobile_no") or data.get("numbers")
+        template_id = data.get("message_id") or data.get("template_id")
 
-        template_id = data.get("message_id")
-        variables_values = "|".join(str(v) for v in vars_list)
+        vars_list = data.get("variables")
+        if vars_list is None:
+            raw_values = data.get("variables_values") or ""
+            variables_values = str(raw_values).strip()
+        elif isinstance(vars_list, list):
+            variables_values = "|".join(str(v) for v in vars_list)
+        elif isinstance(vars_list, str):
+            variables_values = vars_list.strip()
+        else:
+            return JsonResponse({"error": "variables must be a list or string"}, status=400)
+
         result = send_fast2sms_whatsapp_message(
             phone=phone,
             variables_values=variables_values,

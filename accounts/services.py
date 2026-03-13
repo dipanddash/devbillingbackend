@@ -85,7 +85,7 @@ def _get_deletion_ordered_models(app_labels):
     return order
 
 
-def perform_system_reset(superuser_id):
+def perform_system_reset(superuser_id, using="default"):
     """
     Delete **all** business / domain data while preserving:
 
@@ -96,14 +96,18 @@ def perform_system_reset(superuser_id):
     partial failure leaves the database untouched.
     """
     from accounts.models import User  # local import to avoid circular refs
+    from sync.models import CachedCredential
 
     app_labels = _get_business_app_labels()
     ordered = _get_deletion_ordered_models(app_labels)
 
-    with transaction.atomic():
+    with transaction.atomic(using=using):
         for model in ordered:
             if model is User:
                 # Keep the requesting super-admin; remove everyone else
-                model.objects.exclude(id=superuser_id).delete()
+                model.objects.using(using).exclude(id=superuser_id).delete()
+            elif model is CachedCredential:
+                # Preserve the requesting superuser's offline credential mirror.
+                model.objects.using(using).exclude(user_id=superuser_id).delete()
             else:
-                model.objects.all().delete()
+                model.objects.using(using).all().delete()

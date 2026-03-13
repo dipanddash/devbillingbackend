@@ -39,6 +39,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         from sync.sync_service import sync_pending_records
+        from sync.sync_service import refresh_sqlite_from_neon
 
         batch_size = options["batch"]
         drain = options["all"]
@@ -74,3 +75,18 @@ class Command(BaseCommand):
                 f"Done.  total_synced={total_synced}  total_failed={total_failed}"
             )
         )
+
+        mirror_result = refresh_sqlite_from_neon()
+        status = mirror_result.get("status")
+        refreshed = mirror_result.get("refreshed", {})
+        failed = mirror_result.get("failed", {})
+        summary = ", ".join(f"{name}={count}" for name, count in refreshed.items()) or "no tables refreshed"
+
+        if status == "ok":
+            self.stdout.write(self.style.SUCCESS(f"SQLite mirror refreshed. {summary}"))
+        elif status == "partial":
+            failed_summary = ", ".join(failed.keys())
+            self.stdout.write(self.style.WARNING(f"SQLite mirror partially refreshed. {summary}"))
+            self.stderr.write(self.style.WARNING(f"Mirror failed for: {failed_summary}"))
+        elif status == "offline":
+            self.stderr.write(self.style.WARNING("Neon went offline during mirror refresh."))

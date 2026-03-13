@@ -1,7 +1,10 @@
 from rest_framework import serializers
 from django.contrib.auth import authenticate
+from django.contrib.auth import get_user_model
 from django.utils import timezone
-from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from rest_framework_simplejwt.exceptions import AuthenticationFailed, TokenError
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer, TokenRefreshSerializer
+from rest_framework_simplejwt.settings import api_settings
 from .models import Customer, StaffReportAccess, User
 from .models import StaffSessionLog
 from inventory.models import ManualClosing
@@ -107,6 +110,48 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         data["username"] = self.user.username
         data["role"] = current_role
         return data
+
+
+class CustomTokenRefreshSerializer(TokenRefreshSerializer):
+    """
+    Safe refresh serializer that never throws User.DoesNotExist as 500.
+    Returns a standard token error when user is missing/inactive.
+    """
+
+    def validate(self, attrs):
+        refresh = self.token_class(attrs["refresh"])
+
+        user_id = refresh.payload.get(api_settings.USER_ID_CLAIM, None)
+        if user_id:
+            user = get_user_model().objects.filter(
+                **{api_settings.USER_ID_FIELD: user_id}
+            ).first()
+            if user is None:
+                raise TokenError(self.error_messages["no_active_account"])
+            if not api_settings.USER_AUTHENTICATION_RULE(user):
+                raise AuthenticationFailed(
+                    self.error_messages["no_active_account"],
+                    "no_active_account",
+                )
+
+        data = {"access": str(refresh.access_token)}
+
+        if api_settings.ROTATE_REFRESH_TOKENS:
+            if api_settings.BLACKLIST_AFTER_ROTATION:
+                try:
+                    refresh.blacklist()
+                except AttributeError:
+                    pass
+
+            refresh.set_jti()
+            refresh.set_exp()
+            refresh.set_iat()
+            refresh.outstand()
+
+            data["refresh"] = str(refresh)
+
+        return data
+
 
 class CustomerSerializer(serializers.ModelSerializer):
     order_count = serializers.IntegerField(read_only=True)

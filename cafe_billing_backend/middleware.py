@@ -4,9 +4,7 @@ Sets ``request.is_offline`` and an ``X-Offline-Mode`` response header
 so the React frontend can detect the current connectivity state.
 """
 
-import logging
-
-logger = logging.getLogger(__name__)
+from cafe_billing_backend.connectivity import is_neon_reachable
 
 
 class OfflineAwareMiddleware:
@@ -14,9 +12,7 @@ class OfflineAwareMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        from django.conf import settings
-
-        request.is_offline = getattr(settings, "OFFLINE_MODE", False)
+        request.is_offline = not is_neon_reachable(force=True)
         response = self.get_response(request)
         response["X-Offline-Mode"] = "true" if request.is_offline else "false"
         return response

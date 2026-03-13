@@ -6,6 +6,7 @@ from django.db.models import DecimalField, F, Sum, Value
 from django.db.models.functions import Coalesce
 from django.db import transaction
 from decimal import Decimal
+from uuid import uuid4
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 
@@ -28,10 +29,17 @@ from .serializers import (
     PurchaseInvoiceSerializer,
 )
 from rest_framework.parsers import JSONParser
+from cafe_billing_backend.connectivity import is_neon_reachable
 
 # -----------------------
 # INGREDIENT APIs
 # -----------------------
+
+
+def _inventory_db_alias(request=None):
+    if request is not None and getattr(request, "is_offline", False):
+        return "sqlite"
+    return "sqlite" if not is_neon_reachable(force=False) else "neon"
 
 class IngredientListCreateView(generics.ListCreateAPIView):
 
@@ -42,6 +50,24 @@ class IngredientListCreateView(generics.ListCreateAPIView):
         if self.request.method == "POST":
             return [IsAdminOrStaff()]
         return [IsAuthenticated()]
+
+    def perform_create(self, serializer):
+        ingredient = serializer.save()
+        if getattr(self.request, "is_offline", False) or not is_neon_reachable(force=False):
+            from sync.models import OfflineSyncQueue
+
+            OfflineSyncQueue.objects.using("sqlite").create(
+                client_id=uuid4(),
+                entity_type="ingredient",
+                action="create",
+                payload={
+                    "id": str(ingredient.id),
+                    "name": ingredient.name,
+                    "unit": ingredient.unit,
+                    "current_stock": str(ingredient.current_stock),
+                    "min_stock": str(ingredient.min_stock),
+                },
+            )
 
 
 class IngredientDetailView(generics.RetrieveUpdateDestroyAPIView):
@@ -72,6 +98,27 @@ class VendorListCreateView(generics.ListCreateAPIView):
         if self.request.method == "POST":
             return [IsAdminRole()]
         return [IsAuthenticated()]
+
+    def perform_create(self, serializer):
+        vendor = serializer.save()
+        if getattr(self.request, "is_offline", False) or not is_neon_reachable(force=False):
+            from sync.models import OfflineSyncQueue
+
+            OfflineSyncQueue.objects.using("sqlite").create(
+                client_id=uuid4(),
+                entity_type="vendor",
+                action="create",
+                payload={
+                    "id": str(vendor.id),
+                    "name": vendor.name,
+                    "category": vendor.category or "",
+                    "contact_person": vendor.contact_person or "",
+                    "phone": vendor.phone or "",
+                    "email": vendor.email or "",
+                    "city": vendor.city or "",
+                    "address": vendor.address or "",
+                },
+            )
 
 
 class VendorDetailView(generics.RetrieveUpdateDestroyAPIView):
@@ -232,7 +279,9 @@ class OpeningStockInitView(APIView):
     permission_classes = [IsAdminRole]
 
     def post(self, request):
-        if OpeningStock.objects.exists():
+        db_alias = _inventory_db_alias(request)
+
+        if OpeningStock.objects.using(db_alias).exists():
             return Response({"error": "Opening stock has already been initialized."}, status=400)
 
         items = request.data.get("items")
@@ -240,7 +289,9 @@ class OpeningStockInitView(APIView):
             return Response({"error": "items must be a non-empty list."}, status=400)
 
         ingredient_ids = [row.get("ingredient") for row in items if isinstance(row, dict)]
-        ingredients = {str(i.id): i for i in Ingredient.objects.filter(id__in=ingredient_ids)}
+        ingredients = {
+            str(i.id): i for i in Ingredient.objects.using(db_alias).filter(id__in=ingredient_ids)
+        }
         user = request.user if request.user.is_authenticated else None
 
         openings = []
@@ -271,10 +322,29 @@ class OpeningStockInitView(APIView):
             openings.append(OpeningStock(ingredient=ingredient, quantity=qty, set_by=user))
             logs.append(StockLog(ingredient=ingredient, change=qty, reason="OPENING", user=user))
 
-        with transaction.atomic():
-            OpeningStock.objects.bulk_create(openings)
-            Ingredient.objects.bulk_update(touched, ["current_stock"])
-            StockLog.objects.bulk_create(logs)
+        with transaction.atomic(using=db_alias):
+            OpeningStock.objects.using(db_alias).bulk_create(openings)
+            Ingredient.objects.using(db_alias).bulk_update(touched, ["current_stock"])
+            StockLog.objects.using(db_alias).bulk_create(logs)
+
+        if db_alias == "sqlite":
+            from sync.models import OfflineSyncQueue
+
+            OfflineSyncQueue.objects.using("sqlite").create(
+                client_id=uuid4(),
+                entity_type="opening_stock",
+                action="init",
+                payload={
+                    "items": [
+                        {
+                            "ingredient_id": str(opening.ingredient_id),
+                            "quantity": str(opening.quantity),
+                        }
+                        for opening in openings
+                    ],
+                    "set_by_id": str(user.id) if user else None,
+                },
+            )
 
         return Response({"message": "Opening stock initialized.", "count": len(openings)}, status=201)
 
@@ -299,6 +369,7 @@ class ManualClosingCreateView(APIView):
     permission_classes = [IsAdminOrStaff]
 
     def post(self, request):
+        db_alias = _inventory_db_alias(request)
         date_raw = request.data.get("date")
         close_date = parse_date(date_raw) if date_raw else timezone.localdate()
         if not close_date:
@@ -309,12 +380,14 @@ class ManualClosingCreateView(APIView):
             return Response({"error": "items must be a non-empty list."}, status=400)
 
         ingredient_ids = [row.get("ingredient") for row in items if isinstance(row, dict)]
-        ingredients = {str(i.id): i for i in Ingredient.objects.filter(id__in=ingredient_ids)}
+        ingredients = {
+            str(i.id): i for i in Ingredient.objects.using(db_alias).filter(id__in=ingredient_ids)
+        }
         user = request.user if request.user.is_authenticated else None
         saved_rows = []
 
         if (getattr(request.user, "role", "") or "").upper() == "STAFF" and user:
-            already_submitted = ManualClosing.objects.filter(
+            already_submitted = ManualClosing.objects.using(db_alias).filter(
                 entered_by=user,
                 date=close_date,
                 physical_quantity__gt=0,
@@ -330,7 +403,7 @@ class ManualClosingCreateView(APIView):
                     status=400,
                 )
 
-        with transaction.atomic():
+        with transaction.atomic(using=db_alias):
             for row in items:
                 if not isinstance(row, dict):
                     return Response({"error": "Each item must be an object."}, status=400)
@@ -358,14 +431,14 @@ class ManualClosingCreateView(APIView):
                         status=400,
                     )
 
-                manual, _ = ManualClosing.objects.update_or_create(
+                manual, _ = ManualClosing.objects.using(db_alias).update_or_create(
                     ingredient=ingredient,
                     date=close_date,
                     defaults={"physical_quantity": qty, "entered_by": user},
                 )
 
                 difference = calc["system_closing"] - qty
-                DailyStockSnapshot.objects.update_or_create(
+                DailyStockSnapshot.objects.using(db_alias).update_or_create(
                     ingredient=ingredient,
                     date=close_date,
                     defaults={
@@ -383,7 +456,7 @@ class ManualClosingCreateView(APIView):
                 })
 
             if (getattr(request.user, "role", "") or "").upper() == "STAFF":
-                User.objects.filter(role="STAFF", is_active=True).update(
+                User.objects.using(db_alias).filter(role="STAFF", is_active=True).update(
                     is_active=False,
                     day_locked_on=close_date,
                 )
@@ -430,25 +503,31 @@ class StockAuditView(APIView):
     permission_classes = [IsAdminRole]
 
     def get(self, request):
+        db_alias = _inventory_db_alias(request)
         date_raw = request.GET.get("date")
         audit_date = parse_date(date_raw) if date_raw else timezone.localdate()
         if not audit_date:
             return Response({"error": "Invalid date format. Use YYYY-MM-DD."}, status=400)
 
-        ingredients = Ingredient.objects.all().order_by("name")
+        ingredients = Ingredient.objects.using(db_alias).all().order_by("name")
         rows = []
         mismatch_count = 0
 
-        with transaction.atomic():
+        with transaction.atomic(using=db_alias):
             for ingredient in ingredients:
                 calc = _system_closing_for_date(ingredient, audit_date)
-                manual = ManualClosing.objects.filter(ingredient=ingredient, date=audit_date).order_by("-created_at").first()
+                manual = (
+                    ManualClosing.objects.using(db_alias)
+                    .filter(ingredient=ingredient, date=audit_date)
+                    .order_by("-created_at")
+                    .first()
+                )
                 manual_qty = manual.physical_quantity if manual else None
                 difference = (calc["system_closing"] - manual_qty) if manual_qty is not None else None
                 if difference is not None and difference != 0:
                     mismatch_count += 1
 
-                DailyStockSnapshot.objects.update_or_create(
+                DailyStockSnapshot.objects.using(db_alias).update_or_create(
                     ingredient=ingredient,
                     date=audit_date,
                     defaults={

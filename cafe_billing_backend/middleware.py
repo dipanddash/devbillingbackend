@@ -1,13 +1,9 @@
-"""
-Middleware that adds offline-awareness to every request.
-Sets ``request.is_offline`` and an ``X-Offline-Mode`` response header
-so the React frontend can detect the current connectivity state.
-"""
+"""Core middleware for database error shielding and request metadata."""
 
 from django.db import DatabaseError, InterfaceError, OperationalError
 from django.http import JsonResponse
 
-from cafe_billing_backend.connectivity import is_neon_reachable, mark_neon_unreachable
+from cafe_billing_backend.connectivity import mark_neon_unreachable
 
 
 class DatabaseFailureShieldMiddleware:
@@ -59,10 +55,7 @@ class OfflineAwareMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        try:
-            request.is_offline = not is_neon_reachable(force=False)
-        except Exception:
-            request.is_offline = True
+        request.is_offline = False
         response = self.get_response(request)
-        response["X-Offline-Mode"] = "true" if request.is_offline else "false"
+        response["X-Offline-Mode"] = "false"
         return response

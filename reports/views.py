@@ -1,6 +1,5 @@
 from collections import defaultdict
 from decimal import Decimal
-import uuid as uuid_mod
 
 from django.db.models import Count, F, Max, Min, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce, ExtractHour, TruncDate
@@ -17,8 +16,6 @@ from orders.serializers import CouponUsageSerializer
 from orders.utils import format_bill_number, format_order_id
 from payments.models import Payment
 from products.models import ComboItem, Product, Recipe
-from sync.models import OfflineSyncQueue
-from cafe_billing_backend.connectivity import is_neon_reachable
 
 
 def _as_date(value):
@@ -107,38 +104,6 @@ def _payload(request, report_name, summary=None, data=None, product_breakdown=No
             "product_breakdown": product_breakdown or [],
         }
     )
-
-
-def _offline_order_client_id(order_id):
-    return uuid_mod.uuid5(uuid_mod.NAMESPACE_URL, f"offline-order:{order_id}")
-
-
-def _pending_local_paid_orders_for_user(user, target_date):
-    pending_client_ids = {
-        str(client_id)
-        for client_id in (
-            OfflineSyncQueue.objects.using("sqlite")
-            .filter(entity_type="order", action="create", status__in=("PENDING", "IN_PROGRESS", "FAILED"))
-            .values_list("client_id", flat=True)
-        )
-    }
-    if not pending_client_ids:
-        return []
-
-    qs = (
-        Order.objects.using("sqlite")
-        .exclude(status="CANCELLED")
-        .filter(payment_status="PAID", created_at__date=target_date)
-        .order_by("-created_at")
-    )
-    if (getattr(user, "role", "") or "").upper() == "STAFF":
-        qs = qs.filter(staff_id=user.id)
-
-    rows = []
-    for order in qs:
-        if str(_offline_order_client_id(order.id)) in pending_client_ids:
-            rows.append(order)
-    return rows
 
 
 def _report_daily_sales(request):
@@ -942,18 +907,9 @@ class DashboardSummaryView(APIView):
         sales = paid_or_completed.aggregate(v=Coalesce(Sum("total_amount"), Decimal("0.00")))["v"] or Decimal("0.00")
         orders_count = paid_or_completed.count()
 
-        request_is_offline = bool(getattr(request, "is_offline", not is_neon_reachable(force=False)))
-        pending_local_orders = []
-        if not request_is_offline:
-            pending_local_orders = _pending_local_paid_orders_for_user(request.user, target_date=today)
-            pending_sales = sum((order.total_amount or Decimal("0.00") for order in pending_local_orders), Decimal("0.00"))
-            sales += pending_sales
-            orders_count += len(pending_local_orders)
-
         metrics = [
             {"metric": "Total Sales", "value": sales},
             {"metric": "Total Orders", "value": orders_count},
-            {"metric": "Pending Local Orders", "value": len(pending_local_orders)},
         ]
         return _payload(request, "Dashboard Summary", summary=metrics, data=metrics)
 

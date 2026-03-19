@@ -5,10 +5,12 @@ from rest_framework import generics, status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from accounts.permissions import IsAdminOrStaff, IsAdminRole
 
 from .models import Category, Product, Recipe, Addon, Combo, ComboItem
+from .billing_catalog import build_billing_catalog_payload
 from .serializers import (
     CategorySerializer,
     ProductSerializer,
@@ -35,8 +37,7 @@ class SQLiteFallbackQuerysetMixin:
     def should_prefer_sqlite(self):
         pending_catalog_statuses = ("PENDING", "IN_PROGRESS", "FAILED")
         return OfflineSyncQueue.objects.using("sqlite").filter(
-            entity_type__in=("category", "product", "addon", "combo"),
-            action="create",
+            entity_type__in=("category", "product", "addon", "combo", "recipe"),
             status__in=pending_catalog_statuses,
         ).exists()
 
@@ -91,6 +92,30 @@ def _enqueue_catalog_create(entity_type, payload, entity_id):
         entity_type=entity_type,
         action="create",
         payload=payload,
+    )
+
+
+def _enqueue_recipe_sync(action, recipe_id, payload=None):
+    client_id = uuid_mod.uuid5(
+        uuid_mod.NAMESPACE_URL,
+        f"offline-recipe:{action}:{recipe_id}",
+    )
+    existing = OfflineSyncQueue.objects.using("sqlite").filter(client_id=client_id).first()
+    if existing:
+        existing.payload = payload or {}
+        existing.status = "PENDING"
+        existing.retry_count = 0
+        existing.error_message = ""
+        existing.save(
+            using="sqlite",
+            update_fields=["payload", "status", "retry_count", "error_message", "updated_at"],
+        )
+        return
+    OfflineSyncQueue.objects.using("sqlite").create(
+        client_id=client_id,
+        entity_type="recipe",
+        action=action,
+        payload=payload or {},
     )
 
 # ----------------------------
@@ -189,7 +214,7 @@ class ProductUpdateView(SQLiteFallbackQuerysetMixin, generics.RetrieveUpdateDest
 
 class AddonListCreateView(SQLiteFallbackQuerysetMixin, generics.ListCreateAPIView):
 
-    queryset = Addon.objects.all()
+    queryset = Addon.objects.select_related("ingredient", "ingredient__category").all()
     serializer_class = AddonSerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
@@ -208,6 +233,8 @@ class AddonListCreateView(SQLiteFallbackQuerysetMixin, generics.ListCreateAPIVie
                 "id": str(addon.id),
                 "name": addon.name,
                 "price": str(addon.price),
+                "ingredient_id": str(addon.ingredient_id) if addon.ingredient_id else "",
+                "ingredient_quantity": str(addon.ingredient_quantity or 0),
             },
             addon.id,
         )
@@ -259,7 +286,7 @@ class ComboListCreateView(SQLiteFallbackQuerysetMixin, generics.ListCreateAPIVie
 
 class AddonRetrieveUpdateDeleteView(SQLiteFallbackQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
 
-    queryset = Addon.objects.all()
+    queryset = Addon.objects.select_related("ingredient", "ingredient__category").all()
     serializer_class = AddonSerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
@@ -316,6 +343,35 @@ class ComboItemRetrieveUpdateDeleteView(SQLiteFallbackQuerysetMixin, generics.Re
 
 
 # ----------------------------
+# BILLING CATALOG
+# ----------------------------
+
+class BillingCatalogView(APIView):
+    permission_classes = [IsAdminOrStaff]
+
+    @staticmethod
+    def _should_prefer_sqlite():
+        pending_catalog_statuses = ("PENDING", "IN_PROGRESS", "FAILED")
+        return OfflineSyncQueue.objects.using("sqlite").filter(
+            entity_type__in=("category", "product", "addon", "combo", "recipe"),
+            status__in=pending_catalog_statuses,
+        ).exists()
+
+    def get(self, request):
+        preferred_alias = (
+            "sqlite"
+            if self._should_prefer_sqlite()
+            else ("neon" if is_neon_reachable(force=True) else "sqlite")
+        )
+        try:
+            payload = build_billing_catalog_payload(db_alias=preferred_alias)
+            return Response(payload, status=200)
+        except (OperationalError, DatabaseError):
+            payload = build_billing_catalog_payload(db_alias="sqlite")
+            return Response(payload, status=200)
+
+
+# ----------------------------
 # RECIPE
 # ----------------------------
 
@@ -331,9 +387,55 @@ class RecipeListCreateView(SQLiteFallbackQuerysetMixin, generics.ListCreateAPIVi
             queryset = queryset.filter(product_id=product_id)
         return queryset
 
+    def get_permissions(self):
+        if self.request.method == "POST":
+            return [IsAdminRole()]
+        return [IsAuthenticated()]
+
+    def perform_create(self, serializer):
+        recipe = serializer.save()
+        if is_neon_reachable(force=False):
+            return
+        _enqueue_recipe_sync(
+            "upsert",
+            recipe.id,
+            {
+                "id": int(recipe.id),
+                "product_id": str(recipe.product_id),
+                "ingredient_id": str(recipe.ingredient_id),
+                "quantity": str(recipe.quantity),
+            },
+        )
+
 class RecipeUpdateDeleteView(SQLiteFallbackQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
 
     queryset = Recipe.objects.select_related("product", "ingredient")
     serializer_class = RecipeSerializer
     permission_classes = [IsAdminRole]
     parser_classes = [JSONParser]
+
+    def perform_update(self, serializer):
+        recipe = serializer.save()
+        if is_neon_reachable(force=False):
+            return
+        _enqueue_recipe_sync(
+            "upsert",
+            recipe.id,
+            {
+                "id": int(recipe.id),
+                "product_id": str(recipe.product_id),
+                "ingredient_id": str(recipe.ingredient_id),
+                "quantity": str(recipe.quantity),
+            },
+        )
+
+    def perform_destroy(self, instance):
+        recipe_id = instance.id
+        instance.delete()
+        if is_neon_reachable(force=False):
+            return
+        _enqueue_recipe_sync(
+            "delete",
+            recipe_id,
+            {"id": int(recipe_id)},
+        )

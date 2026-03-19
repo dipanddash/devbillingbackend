@@ -12,6 +12,7 @@ from .views import (
     ComboItemRetrieveUpdateDeleteView,
     RecipeListCreateView,
     RecipeUpdateDeleteView,
+    BillingCatalogView,
 )
 
 urlpatterns = [
@@ -29,6 +30,7 @@ urlpatterns = [
     path("products/", ProductListCreateView.as_view()),
     path("addons/", AddonListCreateView.as_view()),
     path("combos/", ComboListCreateView.as_view()),
+    path("billing-catalog/", BillingCatalogView.as_view()),
     path("combo-items/", ComboItemListCreateView.as_view()),
     path("recipes/", RecipeListCreateView.as_view()),
     path("products/<uuid:pk>/", ProductUpdateView.as_view()),

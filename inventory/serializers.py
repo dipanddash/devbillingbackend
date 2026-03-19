@@ -6,7 +6,9 @@ from django.utils import timezone
 from decimal import Decimal
 
 from .models import (
+    DEFAULT_INGREDIENT_CATEGORY_UUID,
     Ingredient,
+    IngredientCategory,
     PurchaseItem,
     StockLog,
     Vendor,
@@ -19,10 +21,153 @@ from .models import (
 # -----------------------
 
 class IngredientSerializer(serializers.ModelSerializer):
+    category_id = serializers.PrimaryKeyRelatedField(
+        source="category",
+        queryset=IngredientCategory.objects.all(),
+        required=False,
+    )
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    valuation = serializers.SerializerMethodField(read_only=True)
+    health = serializers.SerializerMethodField(read_only=True)
+    reorder_qty = serializers.SerializerMethodField(read_only=True)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        db_alias = self.context.get("db_alias")
+        if db_alias:
+            self.fields["category_id"].queryset = IngredientCategory.objects.using(db_alias).all()
 
     class Meta:
         model = Ingredient
-        fields = "__all__"
+        fields = [
+            "id",
+            "name",
+            "category_id",
+            "category_name",
+            "unit",
+            "unit_price",
+            "current_stock",
+            "min_stock",
+            "is_active",
+            "valuation",
+            "health",
+            "reorder_qty",
+        ]
+
+    def validate_unit_price(self, value):
+        if value is None:
+            raise serializers.ValidationError("Unit price is required.")
+        if value <= 0:
+            raise serializers.ValidationError("Unit price must be greater than zero.")
+        return value
+
+    def validate_current_stock(self, value):
+        if value is None:
+            return Decimal("0.000")
+        if value < 0:
+            raise serializers.ValidationError("Current stock cannot be negative.")
+        return value
+
+    def validate_min_stock(self, value):
+        if value is None:
+            return Decimal("0.000")
+        if value < 0:
+            raise serializers.ValidationError("Minimum stock cannot be negative.")
+        return value
+
+    def create(self, validated_data):
+        db_alias = self.context.get("db_alias")
+        if "category" not in validated_data:
+            category_qs = IngredientCategory.objects.using(db_alias) if db_alias else IngredientCategory.objects
+            default_category = category_qs.filter(id=DEFAULT_INGREDIENT_CATEGORY_UUID).first()
+            if default_category is not None:
+                validated_data["category"] = default_category
+        instance = Ingredient(**validated_data)
+        if db_alias:
+            instance.save(using=db_alias)
+        else:
+            instance.save()
+        return instance
+
+    def update(self, instance, validated_data):
+        db_alias = self.context.get("db_alias")
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        if db_alias:
+            instance.save(using=db_alias)
+        else:
+            instance.save()
+        return instance
+
+    def get_valuation(self, obj):
+        return (Decimal(str(obj.current_stock or 0)) * Decimal(str(obj.unit_price or 0))).quantize(Decimal("0.01"))
+
+    def get_health(self, obj):
+        current = Decimal(str(obj.current_stock or 0))
+        minimum = Decimal(str(obj.min_stock or 0))
+        if current <= 0:
+            return "out"
+        if current <= minimum:
+            return "low"
+        return "good"
+
+    def get_reorder_qty(self, obj):
+        current = Decimal(str(obj.current_stock or 0))
+        minimum = Decimal(str(obj.min_stock or 0))
+        if current <= minimum:
+            return (minimum * Decimal("2") - current).quantize(Decimal("0.001"))
+        return Decimal("0.000")
+
+
+class IngredientCategorySerializer(serializers.ModelSerializer):
+    ingredients_count = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = IngredientCategory
+        fields = [
+            "id",
+            "name",
+            "is_active",
+            "ingredients_count",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+    def validate_name(self, value):
+        normalized = (value or "").strip().upper()
+        if not normalized:
+            raise serializers.ValidationError("Category name is required.")
+        db_alias = self.context.get("db_alias")
+        queryset = IngredientCategory.objects.using(db_alias) if db_alias else IngredientCategory.objects
+        queryset = queryset.filter(name=normalized)
+        if self.instance:
+            queryset = queryset.exclude(id=self.instance.id)
+        if queryset.exists():
+            raise serializers.ValidationError("Category already exists.")
+        return normalized
+
+    def create(self, validated_data):
+        db_alias = self.context.get("db_alias")
+        instance = IngredientCategory(**validated_data)
+        if db_alias:
+            instance.save(using=db_alias)
+        else:
+            instance.save()
+        return instance
+
+    def update(self, instance, validated_data):
+        db_alias = self.context.get("db_alias")
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        if db_alias:
+            instance.save(using=db_alias)
+        else:
+            instance.save()
+        return instance
+
+    def get_ingredients_count(self, obj):
+        return obj.ingredients.count()
 
 
 # -----------------------

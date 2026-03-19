@@ -1,9 +1,19 @@
 from decimal import Decimal
 
 from django.db import transaction
+from django.utils import timezone
 from rest_framework import serializers
 
+from inventory.models import DailyIngredientStock, Ingredient
 from .models import Addon, Category, Combo, ComboItem, Product, Recipe
+
+
+def _today_remaining_map(ingredient_ids):
+    today = timezone.localdate()
+    return {
+        str(row.ingredient_id): max(Decimal("0.000"), Decimal(str(row.assigned_stock)) - Decimal(str(row.consumed_stock)))
+        for row in DailyIngredientStock.objects.filter(date=today, ingredient_id__in=ingredient_ids)
+    }
 
 
 class CategorySerializer(serializers.ModelSerializer):
@@ -41,6 +51,9 @@ class ProductSerializer(serializers.ModelSerializer):
         if not recipes:
             return "Recipe not configured"
 
+        ingredient_ids = [recipe.ingredient_id for recipe in recipes if recipe.ingredient_id]
+        remaining_map = _today_remaining_map(ingredient_ids)
+
         for recipe in recipes:
             ingredient = recipe.ingredient
             if ingredient is None:
@@ -51,6 +64,11 @@ class ProductSerializer(serializers.ModelSerializer):
                     f"Insufficient stock: {ingredient.name} "
                     f"(need {required}, have {ingredient.current_stock})"
                 )
+            remaining_today = remaining_map.get(str(recipe.ingredient_id))
+            if remaining_today is None:
+                return "Opening stock is not available. Please contact admin."
+            if remaining_today < required:
+                return f"Assigned stock for today is exhausted: {ingredient.name}"
         return None
 
     def get_is_available(self, obj):
@@ -62,10 +80,48 @@ class ProductSerializer(serializers.ModelSerializer):
 
 class AddonSerializer(serializers.ModelSerializer):
     image_url = serializers.SerializerMethodField()
+    ingredient_id = serializers.PrimaryKeyRelatedField(
+        source="ingredient",
+        queryset=Ingredient.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    ingredient_name = serializers.CharField(source="ingredient.name", read_only=True)
+    ingredient_unit = serializers.CharField(source="ingredient.unit", read_only=True)
+    ingredient_category_id = serializers.CharField(source="ingredient.category_id", read_only=True)
+    ingredient_category_name = serializers.CharField(source="ingredient.category.name", read_only=True)
 
     class Meta:
         model = Addon
-        fields = "__all__"
+        fields = [
+            "id",
+            "name",
+            "price",
+            "image",
+            "image_url",
+            "ingredient_id",
+            "ingredient_name",
+            "ingredient_unit",
+            "ingredient_category_id",
+            "ingredient_category_name",
+            "ingredient_quantity",
+        ]
+
+    def validate(self, attrs):
+        ingredient = attrs.get("ingredient", getattr(self.instance, "ingredient", None))
+        ingredient_quantity = attrs.get(
+            "ingredient_quantity",
+            getattr(self.instance, "ingredient_quantity", Decimal("0")),
+        )
+
+        ingredient_quantity = Decimal(str(ingredient_quantity or 0))
+        if ingredient and ingredient_quantity <= 0:
+            raise serializers.ValidationError(
+                {"ingredient_quantity": "Ingredient quantity must be greater than zero."}
+            )
+        if not ingredient:
+            attrs["ingredient_quantity"] = Decimal("0")
+        return attrs
 
     def get_image_url(self, obj):
         request = self.context.get("request")
@@ -127,6 +183,13 @@ class ComboSerializer(serializers.ModelSerializer):
                     f"Insufficient stock: {data['ingredient_name']} "
                     f"(need {data['needed']}, have {data['stock']})"
                 )
+        remaining_map = _today_remaining_map(needed_by_ingredient.keys())
+        for ingredient_id, data in needed_by_ingredient.items():
+            remaining_today = remaining_map.get(str(ingredient_id))
+            if remaining_today is None:
+                return "Opening stock is not available. Please contact admin."
+            if remaining_today < data["needed"]:
+                return f"Assigned stock for today is exhausted: {data['ingredient_name']}"
         return None
 
     def get_is_available(self, obj):

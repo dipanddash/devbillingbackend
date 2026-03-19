@@ -2,7 +2,8 @@ from rest_framework import generics
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from django.db.models import DecimalField, F, Sum, Value
+from rest_framework.exceptions import ValidationError
+from django.db.models import DecimalField, ExpressionWrapper, F, Sum, Value
 from django.db.models.functions import Coalesce
 from django.db import transaction
 from decimal import Decimal
@@ -14,20 +15,25 @@ from accounts.permissions import IsAdminOrStaff, IsAdminRole
 from accounts.models import User
 
 from .models import (
+    DEFAULT_INGREDIENT_CATEGORY_UUID,
     Ingredient,
+    IngredientCategory,
     Vendor,
     PurchaseInvoice,
     PurchaseItem,
     OpeningStock,
+    DailyIngredientStock,
     ManualClosing,
     DailyStockSnapshot,
     StockLog,
 )
 from .serializers import (
     IngredientSerializer,
+    IngredientCategorySerializer,
     VendorSerializer,
     PurchaseInvoiceSerializer,
 )
+from .stock_service import build_daily_summary, upsert_daily_assignment
 from rest_framework.parsers import JSONParser
 from cafe_billing_backend.connectivity import is_neon_reachable
 
@@ -41,9 +47,128 @@ def _inventory_db_alias(request=None):
         return "sqlite"
     return "sqlite" if not is_neon_reachable(force=False) else "neon"
 
-class IngredientListCreateView(generics.ListCreateAPIView):
 
-    queryset = Ingredient.objects.all().order_by("name")
+def _extract_validation_message(exc):
+    detail = getattr(exc, "detail", exc)
+    if isinstance(detail, (list, tuple)) and detail:
+        first = detail[0]
+        if isinstance(first, (list, tuple)) and first:
+            return str(first[0])
+        return str(first)
+    if isinstance(detail, dict) and detail:
+        first_val = next(iter(detail.values()))
+        if isinstance(first_val, (list, tuple)) and first_val:
+            return str(first_val[0])
+        return str(first_val)
+    return str(detail)
+
+
+def _ensure_default_ingredient_category(db_alias="neon"):
+    manager = IngredientCategory.objects.using(db_alias) if db_alias else IngredientCategory.objects
+    category, _ = manager.get_or_create(
+        id=DEFAULT_INGREDIENT_CATEGORY_UUID,
+        defaults={"name": "OTHERS", "is_active": True},
+    )
+    return category
+
+
+class IngredientCategoryListCreateView(generics.ListCreateAPIView):
+    serializer_class = IngredientCategorySerializer
+
+    def get_permissions(self):
+        if self.request.method == "POST":
+            return [IsAdminRole()]
+        return [IsAuthenticated()]
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["db_alias"] = _inventory_db_alias(self.request)
+        return context
+
+    def get_queryset(self):
+        db_alias = _inventory_db_alias(self.request)
+        _ensure_default_ingredient_category(db_alias=db_alias)
+        queryset = IngredientCategory.objects.using(db_alias).all().order_by("name")
+        search = (self.request.query_params.get("search") or "").strip()
+        is_active = self.request.query_params.get("is_active")
+        if search:
+            queryset = queryset.filter(name__icontains=search)
+        if is_active in {"true", "false"}:
+            queryset = queryset.filter(is_active=(is_active == "true"))
+        return queryset
+
+    def perform_create(self, serializer):
+        db_alias = _inventory_db_alias(self.request)
+        category = serializer.save()
+        if db_alias == "sqlite":
+            from sync.models import OfflineSyncQueue
+
+            OfflineSyncQueue.objects.using("sqlite").create(
+                client_id=uuid4(),
+                entity_type="ingredient_category",
+                action="create",
+                payload={
+                    "id": str(category.id),
+                    "name": category.name,
+                    "is_active": bool(category.is_active),
+                },
+            )
+
+
+class IngredientCategoryDetailView(generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = IngredientCategorySerializer
+    parser_classes = [JSONParser]
+
+    def get_permissions(self):
+        if self.request.method in ["PUT", "PATCH", "DELETE"]:
+            return [IsAdminRole()]
+        return [IsAuthenticated()]
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["db_alias"] = _inventory_db_alias(self.request)
+        return context
+
+    def get_queryset(self):
+        db_alias = _inventory_db_alias(self.request)
+        return IngredientCategory.objects.using(db_alias).all()
+
+    def perform_destroy(self, instance):
+        db_alias = instance._state.db or _inventory_db_alias(self.request)
+        default_category = _ensure_default_ingredient_category(db_alias=db_alias)
+        if instance.id == default_category.id:
+            raise ValidationError("Default category OTHERS cannot be deleted.")
+        Ingredient.objects.using(db_alias).filter(category=instance).update(category=default_category)
+        instance.delete(using=db_alias)
+
+        if db_alias == "sqlite":
+            from sync.models import OfflineSyncQueue
+
+            OfflineSyncQueue.objects.using("sqlite").create(
+                client_id=uuid4(),
+                entity_type="ingredient_category",
+                action="delete",
+                payload={"id": str(instance.id)},
+            )
+
+    def perform_update(self, serializer):
+        db_alias = _inventory_db_alias(self.request)
+        category = serializer.save()
+        if db_alias == "sqlite":
+            from sync.models import OfflineSyncQueue
+
+            OfflineSyncQueue.objects.using("sqlite").create(
+                client_id=uuid4(),
+                entity_type="ingredient_category",
+                action="update",
+                payload={
+                    "id": str(category.id),
+                    "name": category.name,
+                    "is_active": bool(category.is_active),
+                },
+            )
+
+class IngredientListCreateView(generics.ListCreateAPIView):
     serializer_class = IngredientSerializer
 
     def get_permissions(self):
@@ -51,9 +176,52 @@ class IngredientListCreateView(generics.ListCreateAPIView):
             return [IsAdminOrStaff()]
         return [IsAuthenticated()]
 
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["db_alias"] = _inventory_db_alias(self.request)
+        return context
+
+    def get_queryset(self):
+        db_alias = _inventory_db_alias(self.request)
+        queryset = Ingredient.objects.using(db_alias).select_related("category").all()
+        category_id = (
+            self.request.query_params.get("category_id")
+            or self.request.query_params.get("category")
+            or ""
+        ).strip()
+        search = (self.request.query_params.get("search") or "").strip()
+        health = (self.request.query_params.get("health") or "").strip().lower()
+        sort = (self.request.query_params.get("sort") or "").strip().lower()
+
+        if category_id and category_id.lower() != "all":
+            queryset = queryset.filter(category_id=category_id)
+        if search:
+            queryset = queryset.filter(name__icontains=search)
+        if health == "out":
+            queryset = queryset.filter(current_stock__lte=0)
+        elif health == "low":
+            queryset = queryset.filter(current_stock__gt=0, current_stock__lte=F("min_stock"))
+        elif health in {"healthy", "good"}:
+            queryset = queryset.filter(current_stock__gt=F("min_stock"))
+
+        if sort == "stock":
+            queryset = queryset.order_by("-current_stock", "name")
+        elif sort == "valuation":
+            queryset = queryset.annotate(
+                valuation_sort=ExpressionWrapper(
+                    F("current_stock") * F("unit_price"),
+                    output_field=DecimalField(max_digits=14, decimal_places=2),
+                )
+            ).order_by("-valuation_sort", "name")
+        else:
+            queryset = queryset.order_by("name")
+        return queryset
+
     def perform_create(self, serializer):
+        db_alias = _inventory_db_alias(self.request)
+        _ensure_default_ingredient_category(db_alias=db_alias)
         ingredient = serializer.save()
-        if getattr(self.request, "is_offline", False) or not is_neon_reachable(force=False):
+        if db_alias == "sqlite":
             from sync.models import OfflineSyncQueue
 
             OfflineSyncQueue.objects.using("sqlite").create(
@@ -63,27 +231,34 @@ class IngredientListCreateView(generics.ListCreateAPIView):
                 payload={
                     "id": str(ingredient.id),
                     "name": ingredient.name,
+                    "category_id": str(ingredient.category_id) if ingredient.category_id else None,
+                    "category_name": ingredient.category.name if ingredient.category else "OTHERS",
                     "unit": ingredient.unit,
+                    "unit_price": str(ingredient.unit_price),
                     "current_stock": str(ingredient.current_stock),
                     "min_stock": str(ingredient.min_stock),
+                    "is_active": ingredient.is_active,
                 },
             )
 
 
-class IngredientDetailView(generics.RetrieveUpdateDestroyAPIView):
-
-    queryset = Ingredient.objects.all()
-    serializer_class = IngredientSerializer
-    
-
-
-
 class IngredientUpdateDeleteView(generics.RetrieveUpdateDestroyAPIView):
-
-    queryset = Ingredient.objects.all()
     serializer_class = IngredientSerializer
-    permission_classes = [IsAdminRole]
     parser_classes = [JSONParser]
+
+    def get_permissions(self):
+        if self.request.method in ["PUT", "PATCH", "DELETE"]:
+            return [IsAdminRole()]
+        return [IsAuthenticated()]
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["db_alias"] = _inventory_db_alias(self.request)
+        return context
+
+    def get_queryset(self):
+        db_alias = _inventory_db_alias(self.request)
+        return Ingredient.objects.using(db_alias).select_related("category").all()
 
 # -----------------------
 # VENDOR APIs
@@ -247,6 +422,17 @@ def _sum_stock_change(ingredient, date, reason, positive=True):
 
 
 def _base_stock_before_date(ingredient, date):
+    previous_daily = (
+        DailyIngredientStock.objects
+        .filter(ingredient=ingredient, date__lt=date)
+        .order_by("-date")
+        .first()
+    )
+    if previous_daily:
+        remaining = previous_daily.assigned_stock - previous_daily.consumed_stock
+        if remaining > 0:
+            return remaining
+
     previous_manual = (
         ManualClosing.objects
         .filter(ingredient=ingredient, date__lt=date)
@@ -280,52 +466,24 @@ class OpeningStockInitView(APIView):
 
     def post(self, request):
         db_alias = _inventory_db_alias(request)
-
-        if OpeningStock.objects.using(db_alias).exists():
-            return Response({"error": "Opening stock has already been initialized."}, status=400)
-
         items = request.data.get("items")
-        if not isinstance(items, list) or not items:
-            return Response({"error": "items must be a non-empty list."}, status=400)
+        date_raw = request.data.get("date")
+        target_date = parse_date(date_raw) if date_raw else timezone.localdate()
+        if not target_date:
+            return Response({"error": "Invalid date format. Use YYYY-MM-DD."}, status=400)
 
-        ingredient_ids = [row.get("ingredient") for row in items if isinstance(row, dict)]
-        ingredients = {
-            str(i.id): i for i in Ingredient.objects.using(db_alias).filter(id__in=ingredient_ids)
-        }
         user = request.user if request.user.is_authenticated else None
-
-        openings = []
-        logs = []
-        touched = []
-        seen_ids = set()
-
-        for row in items:
-            if not isinstance(row, dict):
-                return Response({"error": "Each item must be an object."}, status=400)
-            ing_id = str(row.get("ingredient") or "").strip()
-            qty_raw = row.get("quantity")
-            ingredient = ingredients.get(ing_id)
-            if not ingredient:
-                return Response({"error": f"Invalid ingredient id: {ing_id}"}, status=400)
-            if ing_id in seen_ids:
-                return Response({"error": f"Duplicate ingredient in payload: {ing_id}"}, status=400)
-            seen_ids.add(ing_id)
-            try:
-                qty = Decimal(str(qty_raw))
-            except Exception:  # noqa: BLE001
-                return Response({"error": f"Invalid quantity for ingredient: {ingredient.name}"}, status=400)
-            if qty < 0:
-                return Response({"error": f"Quantity cannot be negative for ingredient: {ingredient.name}"}, status=400)
-
-            ingredient.current_stock = qty
-            touched.append(ingredient)
-            openings.append(OpeningStock(ingredient=ingredient, quantity=qty, set_by=user))
-            logs.append(StockLog(ingredient=ingredient, change=qty, reason="OPENING", user=user))
-
-        with transaction.atomic(using=db_alias):
-            OpeningStock.objects.using(db_alias).bulk_create(openings)
-            Ingredient.objects.using(db_alias).bulk_update(touched, ["current_stock"])
-            StockLog.objects.using(db_alias).bulk_create(logs)
+        try:
+            assigned_rows = upsert_daily_assignment(
+                items=items,
+                target_date=target_date,
+                user=user,
+                db_alias=db_alias,
+            )
+        except ValidationError as exc:
+            return Response({"error": _extract_validation_message(exc)}, status=400)
+        except Exception as exc:  # noqa: BLE001
+            return Response({"error": str(exc)}, status=400)
 
         if db_alias == "sqlite":
             from sync.models import OfflineSyncQueue
@@ -335,31 +493,171 @@ class OpeningStockInitView(APIView):
                 entity_type="opening_stock",
                 action="init",
                 payload={
+                    "date": target_date.isoformat(),
                     "items": [
                         {
-                            "ingredient_id": str(opening.ingredient_id),
-                            "quantity": str(opening.quantity),
+                            "ingredient_id": str(row.ingredient_id),
+                            "quantity": str(row.assigned_stock),
                         }
-                        for opening in openings
+                        for row in assigned_rows
                     ],
                     "set_by_id": str(user.id) if user else None,
                 },
             )
 
-        return Response({"message": "Opening stock initialized.", "count": len(openings)}, status=201)
+        return Response(
+            {
+                "message": "Daily stock assigned successfully.",
+                "date": target_date.isoformat(),
+                "count": len(assigned_rows),
+            },
+            status=201,
+        )
 
 
 class OpeningStockStatusView(APIView):
     permission_classes = [IsAdminRole]
 
     def get(self, request):
-        qs = OpeningStock.objects.all().order_by("created_at")
-        first = qs.first()
+        db_alias = _inventory_db_alias(request)
+        date_raw = request.GET.get("date")
+        target_date = parse_date(date_raw) if date_raw else timezone.localdate()
+        if not target_date:
+            return Response({"error": "Invalid date format. Use YYYY-MM-DD."}, status=400)
+
+        summary = build_daily_summary(target_date=target_date, db_alias=db_alias)
+        totals = summary["totals"]
+        assigned_today = Decimal(str(totals["assigned_today"]))
         return Response(
             {
-                "initialized": qs.exists(),
-                "count": qs.count(),
-                "initialized_on": timezone.localtime(first.created_at).isoformat() if first else None,
+                "date": summary["date"],
+                "initialized": assigned_today > 0,
+                "count": int(totals["ingredients_count"]),
+                "assigned_today": str(totals["assigned_today"]),
+                "used_today": str(totals["used_today"]),
+                "remaining_today": str(totals["remaining_today"]),
+                "valuation": str(totals["valuation"]),
+            },
+            status=200,
+        )
+
+
+class DailyStockSummaryView(APIView):
+    permission_classes = [IsAdminOrStaff]
+
+    def get(self, request):
+        db_alias = _inventory_db_alias(request)
+        date_raw = request.GET.get("date")
+        category_id = (request.GET.get("category_id") or request.GET.get("category") or "").strip()
+        target_date = parse_date(date_raw) if date_raw else timezone.localdate()
+        if not target_date:
+            return Response({"error": "Invalid date format. Use YYYY-MM-DD."}, status=400)
+
+        summary = build_daily_summary(target_date=target_date, db_alias=db_alias)
+        source_rows = summary["rows"]
+        if category_id and category_id.lower() != "all":
+            source_rows = [row for row in source_rows if str(row.get("category_id") or "") == category_id]
+
+        total_assigned = Decimal("0.000")
+        total_used = Decimal("0.000")
+        total_remaining = Decimal("0.000")
+        total_valuation = Decimal("0.00")
+        rows = []
+        for row in source_rows:
+            total_assigned += Decimal(str(row["assigned_today"]))
+            total_used += Decimal(str(row["used_today"]))
+            total_remaining += Decimal(str(row["remaining_today"]))
+            total_valuation += Decimal(str(row["valuation"]))
+            rows.append(
+                {
+                    "ingredient_id": row["ingredient_id"],
+                    "ingredient_name": row["ingredient_name"],
+                    "category_id": row["category_id"],
+                    "category_name": row["category_name"],
+                    "unit": row["unit"],
+                    "unit_price": str(row["unit_price"]),
+                    "assigned_today": str(row["assigned_today"]),
+                    "used_today": str(row["used_today"]),
+                    "remaining_today": str(row["remaining_today"]),
+                    "carry_forward": str(row["carry_forward"]),
+                    "total_stock": str(row["total_stock"]),
+                    "min_stock": str(row["min_stock"]),
+                    "valuation": str(row["valuation"]),
+                    "health": row["health"],
+                    "is_active": row["is_active"],
+                }
+            )
+        return Response(
+            {
+                "date": summary["date"],
+                "totals": {
+                    "ingredients_count": len(rows),
+                    "assigned_today": str(total_assigned.quantize(Decimal("0.000"))),
+                    "used_today": str(total_used.quantize(Decimal("0.000"))),
+                    "remaining_today": str(total_remaining.quantize(Decimal("0.000"))),
+                    "valuation": str(total_valuation.quantize(Decimal("0.00"))),
+                },
+                "rows": rows,
+            },
+            status=200,
+        )
+
+
+class DailyStockAssignView(APIView):
+    permission_classes = [IsAdminRole]
+
+    def post(self, request):
+        db_alias = _inventory_db_alias(request)
+        date_raw = request.data.get("date")
+        target_date = parse_date(date_raw) if date_raw else timezone.localdate()
+        if not target_date:
+            return Response({"error": "Invalid date format. Use YYYY-MM-DD."}, status=400)
+
+        items = request.data.get("items")
+        user = request.user if request.user.is_authenticated else None
+        try:
+            assigned_rows = upsert_daily_assignment(
+                items=items,
+                target_date=target_date,
+                user=user,
+                db_alias=db_alias,
+            )
+        except ValidationError as exc:
+            return Response({"error": _extract_validation_message(exc)}, status=400)
+        except Exception as exc:  # noqa: BLE001
+            return Response({"error": str(exc)}, status=400)
+
+        if db_alias == "sqlite":
+            from sync.models import OfflineSyncQueue
+
+            OfflineSyncQueue.objects.using("sqlite").create(
+                client_id=uuid4(),
+                entity_type="opening_stock",
+                action="init",
+                payload={
+                    "date": target_date.isoformat(),
+                    "items": [
+                        {
+                            "ingredient_id": str(row.ingredient_id),
+                            "quantity": str(row.assigned_stock),
+                        }
+                        for row in assigned_rows
+                    ],
+                    "set_by_id": str(user.id) if user else None,
+                },
+            )
+
+        summary = build_daily_summary(target_date=target_date, db_alias=db_alias)
+        return Response(
+            {
+                "message": "Daily stock assignment saved.",
+                "date": summary["date"],
+                "count": len(assigned_rows),
+                "totals": {
+                    "assigned_today": str(summary["totals"]["assigned_today"]),
+                    "used_today": str(summary["totals"]["used_today"]),
+                    "remaining_today": str(summary["totals"]["remaining_today"]),
+                },
             },
             status=200,
         )

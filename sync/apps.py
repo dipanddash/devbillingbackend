@@ -41,7 +41,7 @@ class SyncConfig(AppConfig):
             try:
                 from django.core.management import call_command
 
-                logger.info("Setting up local SQLite database …")
+                logger.info("Setting up local SQLite database...")
                 call_command(
                     "migrate",
                     "--database=sqlite",
@@ -51,7 +51,7 @@ class SyncConfig(AppConfig):
                 logger.info("Local SQLite database ready.")
             except Exception as exc:
                 logger.warning(
-                    "Auto-migrate sqlite failed: %s  —  "
+                    "Auto-migrate sqlite failed: %s. "
                     'Run "python manage.py prepare_offline" manually.',
                     exc,
                 )

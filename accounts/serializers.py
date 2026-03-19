@@ -5,6 +5,7 @@ from django.utils import timezone
 from rest_framework_simplejwt.exceptions import AuthenticationFailed, TokenError
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer, TokenRefreshSerializer
 from rest_framework_simplejwt.settings import api_settings
+from orders.billing import normalize_phone
 from .models import Customer, StaffReportAccess, User
 from .models import StaffSessionLog
 from inventory.models import ManualClosing
@@ -179,6 +180,18 @@ class CustomerSerializer(serializers.ModelSerializer):
             "total_spent",
             "last_visit_at",
         ]
+
+    def validate_name(self, value):
+        name = str(value or "").strip()
+        if not name:
+            raise serializers.ValidationError("Customer name is required")
+        return name
+
+    def validate_phone(self, value):
+        phone = normalize_phone(value)
+        if not phone:
+            raise serializers.ValidationError("Valid 10-digit phone is required")
+        return phone
 
 
 class StaffUserSerializer(serializers.ModelSerializer):

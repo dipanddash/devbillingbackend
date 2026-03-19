@@ -14,7 +14,7 @@ from pathlib import Path
 from datetime import timedelta
 import logging
 import os
-import socket
+import psycopg2
 from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -67,6 +67,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'cafe_billing_backend.middleware.DatabaseFailureShieldMiddleware',
     'cafe_billing_backend.middleware.OfflineAwareMiddleware',
 ]
 
@@ -95,17 +96,33 @@ WSGI_APPLICATION = 'cafe_billing_backend.wsgi.application'
 
 # ── Connectivity check ───────────────────────────────────────────────
 def _check_neon_connectivity():
-    """Fast TCP socket probe — returns True if Neon host is reachable."""
+    """DB-level connectivity check to avoid socket false positives."""
+    if os.getenv("FORCE_OFFLINE_MODE", "").strip().lower() in {"1", "true", "yes"}:
+        return False
+
     host = os.getenv("DB_HOST", "")
     port = int(os.getenv("DB_PORT", "5432"))
     timeout = min(int(os.getenv("DB_CONNECT_TIMEOUT", "5")), 5)
     if not host:
         return False
+
     try:
-        s = socket.create_connection((host, port), timeout=timeout)
-        s.close()
+        conn = psycopg2.connect(
+            dbname=os.getenv("DB_NAME", "neondb"),
+            user=os.getenv("DB_USER", "neondb_owner"),
+            password=os.getenv("DB_PASSWORD", ""),
+            host=host,
+            port=port,
+            connect_timeout=timeout,
+            sslmode=os.getenv("DB_SSLMODE", "require"),
+            channel_binding=os.getenv("DB_CHANNEL_BINDING", "require"),
+        )
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        conn.close()
         return True
-    except (socket.timeout, socket.error, OSError):
+    except Exception:
         return False
 
 _IS_ONLINE = _check_neon_connectivity()
@@ -129,6 +146,12 @@ _NEON_DB = {
     "PORT": os.getenv("DB_PORT", "5432"),
     "CONN_MAX_AGE": int(os.getenv("DB_CONN_MAX_AGE", "300")),
     "CONN_HEALTH_CHECKS": True,
+    # Neon pooler uses transaction pooling; server-side cursors are unstable there.
+    # Keep this disabled to avoid InvalidCursorName errors during long iterators.
+    "DISABLE_SERVER_SIDE_CURSORS": os.getenv(
+        "DB_DISABLE_SERVER_SIDE_CURSORS",
+        "true",
+    ).strip().lower() in {"1", "true", "yes"},
     "OPTIONS": {
         "sslmode": os.getenv("DB_SSLMODE", "require"),
         "channel_binding": os.getenv("DB_CHANNEL_BINDING", "require"),
@@ -203,6 +226,7 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "accounts.authentication.OfflineAwareJWTAuthentication",
     ),
+    "EXCEPTION_HANDLER": "cafe_billing_backend.exception_handlers.drf_exception_handler",
 }
 
 SIMPLE_JWT = {

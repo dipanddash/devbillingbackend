@@ -1,13 +1,44 @@
 import uuid
+from decimal import Decimal
 from django.db import models
 from django.conf import settings
+
+DEFAULT_INGREDIENT_CATEGORY_UUID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
+
+class IngredientCategory(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=120, unique=True, db_index=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def save(self, *args, **kwargs):
+        self.name = (self.name or "").strip().upper()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.name
+
 
 class Ingredient(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=150, unique=True)
+    category = models.ForeignKey(
+        IngredientCategory,
+        on_delete=models.PROTECT,
+        related_name="ingredients",
+        default=DEFAULT_INGREDIENT_CATEGORY_UUID,
+        db_index=True,
+    )
     unit = models.CharField(max_length=50)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     current_stock = models.DecimalField(max_digits=12, decimal_places=3, default=0)
     min_stock = models.DecimalField(max_digits=12, decimal_places=3, default=0)
+    is_active = models.BooleanField(default=True, db_index=True)
 
     def save(self, *args, **kwargs):
         self.name = self.name.upper()
@@ -37,12 +68,6 @@ class OpeningStock(models.Model):
     quantity = models.DecimalField(max_digits=12, decimal_places=3)
     set_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
-
-    def save(self, *args, **kwargs):
-        if self.pk is not None:
-            raise ValueError("Opening stock cannot be modified.")
-
-        super().save(*args, **kwargs)
 
 class Vendor(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -126,4 +151,33 @@ class DailyStockSnapshot(models.Model):
 
     class Meta:
         unique_together = ("ingredient", "date")
+
+
+class DailyIngredientStock(models.Model):
+    ingredient = models.ForeignKey(
+        Ingredient,
+        on_delete=models.CASCADE,
+        related_name="daily_assignments",
+    )
+    date = models.DateField(db_index=True)
+    assigned_stock = models.DecimalField(max_digits=12, decimal_places=3, default=0)
+    consumed_stock = models.DecimalField(max_digits=12, decimal_places=3, default=0)
+    carry_forward_stock = models.DecimalField(max_digits=12, decimal_places=3, default=0)
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("ingredient", "date")
+        ordering = ["-date", "ingredient__name"]
+
+    @property
+    def remaining_stock(self):
+        remaining = self.assigned_stock - self.consumed_stock
+        return remaining if remaining > 0 else Decimal("0.000")
 

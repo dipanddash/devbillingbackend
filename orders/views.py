@@ -6,7 +6,7 @@ import logging
 import uuid as uuid_mod
 
 from django.conf import settings
-from django.db import transaction
+from django.db import transaction, DatabaseError, InterfaceError, OperationalError
 from django.db.models import Count, Sum, F, DecimalField, Prefetch, Q
 from django.db.models.functions import Coalesce
 from django.http import JsonResponse
@@ -23,7 +23,7 @@ from rest_framework.exceptions import ValidationError
 from accounts.models import Customer
 from accounts.permissions import IsAdminOrStaff, IsAdminRole
 from payments.models import Payment
-from inventory.models import StockLog, Ingredient
+from inventory.stock_service import consume_ingredients_for_sale, reverse_consumed_ingredients
 from products.models import Product, Recipe, Combo, Addon
 from tables.models import TableSession
 from sync.models import OfflineSyncQueue
@@ -40,6 +40,15 @@ from .serializers import (
     CouponUsageSerializer,
 )
 from .utils import format_order_id, format_bill_number
+from .billing import (
+    calculate_line_amounts,
+    calculate_payable_amount,
+    normalize_phone,
+    parse_non_negative_amount,
+    parse_positive_quantity,
+    quantize_money,
+    to_decimal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,43 +63,72 @@ def _refresh_sqlite_order_cache():
 
 
 def _parse_positive_quantity(value):
-    if isinstance(value, bool):
-        raise ValueError("Quantity must be a valid integer")
-
-    if isinstance(value, int):
-        qty = value
-    elif isinstance(value, str):
-        raw = value.strip()
-        if not raw:
-            raise ValueError("Quantity must be a valid integer")
-        qty = int(raw)
-    else:
-        raise ValueError("Quantity must be a valid integer")
-
-    if qty <= 0:
-        raise ValueError("Quantity must be greater than 0")
-    return qty
+    return parse_positive_quantity(value)
 
 
 def _parse_non_negative_amount(value):
-    if value in (None, ""):
-        raise ValueError("Amount is required")
-    try:
-        amount = Decimal(str(value).strip())
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError("Amount must be numeric") from exc
-    if amount < 0:
-        raise ValueError("Amount cannot be negative")
-    return amount
+    return parse_non_negative_amount(value)
+
+
+def _round_currency_rupee(value):
+    return quantize_money(value)
+
+
+def _resolve_order_display_status(order):
+    if order.payment_status == "PAID":
+        return "PAID"
+    if order.payment_status == "REFUNDED":
+        return "REFUNDED"
+    if order.status == "CANCELLED":
+        return "CANCELLED"
+    return "PENDING"
 
 
 def _normalize_phone_number(phone):
-    if not phone:
-        return None
-    digits = "".join(ch for ch in str(phone) if ch.isdigit())
-    if len(digits) < 10:
-        return None
-    return digits[-10:]
+    normalized = normalize_phone(phone)
+    return normalized or None
+
+
+def _accumulate_addon_ingredient_usage(
+    order_item,
+    target_usage,
+    ingredient_details=None,
+    include_item_quantity=True,
+):
+    addon_counts = defaultdict(int)
+    addons_by_id = {}
+    addon_rows = order_item.addons.all()
+
+    for addon_row in addon_rows:
+        addon = addon_row.addon
+        if not addon or not addon.ingredient_id:
+            continue
+        addon_key = str(addon.id)
+        addon_counts[addon_key] += 1
+        addons_by_id[addon_key] = addon
+
+    if not addon_counts:
+        return
+
+    item_quantity = Decimal("1")
+    if include_item_quantity:
+        item_quantity = to_decimal(getattr(order_item, "quantity", 0), default="0")
+        if item_quantity <= 0:
+            return
+
+    for addon_key, qty_per_item in addon_counts.items():
+        addon = addons_by_id.get(addon_key)
+        if addon is None:
+            continue
+        per_unit_qty = to_decimal(getattr(addon, "ingredient_quantity", 0), default="0")
+        if per_unit_qty <= 0:
+            continue
+        total_qty = per_unit_qty * to_decimal(qty_per_item, default="0") * item_quantity
+        if total_qty <= 0:
+            continue
+        target_usage[addon.ingredient_id] += total_qty
+        if ingredient_details is not None and addon.ingredient is not None:
+            ingredient_details[addon.ingredient_id] = addon.ingredient
 
 
 def send_fast2sms_whatsapp_message(phone, variables_values, message_id=None):
@@ -186,11 +224,32 @@ def send_order_invoice_whatsapp(order, bill_number, final_amount, method):
 
 def _build_order_sync_payload(order, method, reference_id):
     items_payload = []
+    db_alias = order._state.db or "default"
     order_items = (
         order.items.select_related("product", "combo")
-        .prefetch_related("addons__addon")
+        .prefetch_related("addons__addon__ingredient")
         .all()
     )
+
+    product_ids = set()
+    for item in order_items:
+        if item.product_id:
+            product_ids.add(item.product_id)
+            continue
+        if item.combo_id and item.combo:
+            for combo_item in item.combo.items.using(db_alias).all():
+                product_ids.add(combo_item.product_id)
+
+    recipes_by_product = defaultdict(list)
+    if product_ids:
+        recipes = (
+            Recipe.objects.using(db_alias)
+            .filter(product_id__in=product_ids)
+            .select_related("ingredient")
+        )
+        for recipe in recipes:
+            recipes_by_product[recipe.product_id].append(recipe)
+
     for item in order_items:
         addon_counts = defaultdict(int)
         for addon_row in item.addons.all():
@@ -198,11 +257,42 @@ def _build_order_sync_payload(order, method, reference_id):
                 addon_counts[str(addon_row.addon_id)] += 1
         addons = [{"id": addon_id, "quantity": qty} for addon_id, qty in addon_counts.items()]
 
+        ingredient_blueprint_map = defaultdict(Decimal)
+        ingredient_details = {}
+        if item.product_id:
+            for recipe in recipes_by_product.get(item.product_id, []):
+                ingredient_blueprint_map[recipe.ingredient_id] += recipe.quantity
+                ingredient_details[recipe.ingredient_id] = recipe.ingredient
+        elif item.combo_id and item.combo:
+            for combo_item in item.combo.items.using(db_alias).all():
+                combo_qty = to_decimal(combo_item.quantity, default="1")
+                for recipe in recipes_by_product.get(combo_item.product_id, []):
+                    ingredient_blueprint_map[recipe.ingredient_id] += recipe.quantity * combo_qty
+                    ingredient_details[recipe.ingredient_id] = recipe.ingredient
+
+        _accumulate_addon_ingredient_usage(
+            item,
+            ingredient_blueprint_map,
+            ingredient_details=ingredient_details,
+            include_item_quantity=False,
+        )
+
         row = {
             "quantity": int(item.quantity),
             "base_price": str(item.base_price),
             "gst_percent": str(item.gst_percent),
+            "gst_amount": str(item.gst_amount),
+            "price_at_time": str(item.price_at_time),
             "addons": addons,
+            "ingredient_blueprint": [
+                {
+                    "ingredient_id": str(ingredient_id),
+                    "ingredient_name": ingredient_details[ingredient_id].name if ingredient_details.get(ingredient_id) else "",
+                    "quantity": str(quantity),
+                    "unit": ingredient_details[ingredient_id].unit if ingredient_details.get(ingredient_id) else "",
+                }
+                for ingredient_id, quantity in ingredient_blueprint_map.items()
+            ],
         }
         if item.product_id:
             row["product"] = str(item.product_id)
@@ -211,9 +301,13 @@ def _build_order_sync_payload(order, method, reference_id):
         items_payload.append(row)
 
     return {
+        "order_id": str(order.id),
         "order_type": order.order_type,
         "customer_name": order.customer_name or "",
-        "customer_phone": order.customer_phone or "",
+        "customer_phone": normalize_phone(order.customer_phone),
+        "status": order.status,
+        "payment_status": order.payment_status,
+        "total_amount": str(order.total_amount or Decimal("0.00")),
         "discount_amount": str(order.discount_amount or Decimal("0.00")),
         "items": items_payload,
         "payment": {
@@ -225,7 +319,7 @@ def _build_order_sync_payload(order, method, reference_id):
 
 
 def _enqueue_offline_paid_order(order, method, reference_id):
-    client_id = uuid_mod.uuid5(uuid_mod.NAMESPACE_URL, f"offline-order:{order.id}")
+    client_id = _offline_order_client_id(order.id)
     if OfflineSyncQueue.objects.using("sqlite").filter(client_id=client_id).exists():
         return
 
@@ -236,6 +330,97 @@ def _enqueue_offline_paid_order(order, method, reference_id):
         action="create",
         payload=payload,
     )
+
+
+def _offline_order_client_id(order_id):
+    return uuid_mod.uuid5(uuid_mod.NAMESPACE_URL, f"offline-order:{order_id}")
+
+
+def _offline_customer_client_id(phone):
+    return uuid_mod.uuid5(uuid_mod.NAMESPACE_URL, f"offline-customer:{phone}")
+
+
+def _enqueue_offline_customer_create(customer):
+    phone = normalize_phone(customer.phone)
+    if not phone:
+        return
+    client_id = _offline_customer_client_id(phone)
+    existing = OfflineSyncQueue.objects.using("sqlite").filter(client_id=client_id).first()
+    if existing:
+        existing.payload = {
+            "id": str(customer.id),
+            "name": customer.name or "Customer",
+            "phone": phone,
+        }
+        existing.status = "PENDING"
+        existing.retry_count = 0
+        existing.error_message = ""
+        existing.save(
+            using="sqlite",
+            update_fields=["payload", "status", "retry_count", "error_message", "updated_at"],
+        )
+        return
+    OfflineSyncQueue.objects.using("sqlite").create(
+        client_id=client_id,
+        entity_type="customer",
+        action="create",
+        payload={
+            "id": str(customer.id),
+            "name": customer.name or "Customer",
+            "phone": phone,
+        },
+    )
+
+
+def _pending_local_paid_orders_for_user(user, limit=100, start_date=None, end_date=None):
+    pending_client_ids = {
+        str(client_id)
+        for client_id in (
+            OfflineSyncQueue.objects.using("sqlite")
+            .filter(entity_type="order", action="create", status__in=("PENDING", "IN_PROGRESS", "FAILED"))
+            .values_list("client_id", flat=True)
+        )
+    }
+    if not pending_client_ids:
+        return []
+
+    qs = (
+        Order.objects.using("sqlite")
+        .select_related("table", "customer")
+        .annotate(items_count=Count("items"))
+        .exclude(status="CANCELLED")
+        .filter(payment_status="PAID")
+        .order_by("-created_at")
+    )
+    if (getattr(user, "role", "") or "").upper() == "STAFF":
+        qs = qs.filter(staff_id=user.id)
+    if start_date:
+        qs = qs.filter(created_at__date__gte=start_date)
+    if end_date:
+        qs = qs.filter(created_at__date__lte=end_date)
+
+    rows = []
+    for order in qs:
+        client_id = str(_offline_order_client_id(order.id))
+        if client_id not in pending_client_ids:
+            continue
+        rows.append(order)
+        if limit and len(rows) >= limit:
+            break
+    return rows
+
+
+def _find_customer_by_phone(phone, aliases):
+    for alias in aliases:
+        customer = (
+            Customer.objects.using(alias)
+            .filter(phone__endswith=phone)
+            .order_by("-created_at")
+            .first()
+        )
+        if customer:
+            return customer, alias
+    return None, None
 
 
 def apply_order_filters(request, queryset):
@@ -391,11 +576,10 @@ class CouponValidateView(APIView):
         if coupon.max_uses is not None and coupon.usage_records.count() >= coupon.max_uses:
             return error_response("Coupon max usage limit reached", 400)
 
-        customer_phone = str(
+        customer_phone = normalize_phone(
             request.data.get("customer_phone")
             or request.data.get("customerPhone")
-            or ""
-        ).strip()
+        )
         if coupon.first_time_only:
             if not customer_phone:
                 return error_response("Customer phone required for first-time-only coupon", 400)
@@ -560,7 +744,12 @@ class OrderCancelView(APIView):
         with transaction.atomic():
             # If order is already paid/completed, reverse ingredient usage before cancelling.
             if order.payment_status == "PAID" or order.status == "COMPLETED":
-                order_items = list(order.items.all())
+                order_items = list(
+                    order.items.select_related("product", "combo").prefetch_related(
+                        "combo__items",
+                        "addons__addon__ingredient",
+                    )
+                )
                 product_ids = set()
 
                 for item in order_items:
@@ -604,34 +793,15 @@ class OrderCancelView(APIView):
                             for recipe in item_recipes:
                                 ingredient_restore[recipe.ingredient_id] += recipe.quantity * combined_qty
 
+                    _accumulate_addon_ingredient_usage(item, ingredient_restore)
+
                 if ingredient_restore:
-                    ingredients = {
-                        ingredient.id: ingredient
-                        for ingredient in Ingredient.objects.select_for_update().filter(id__in=ingredient_restore.keys())
-                    }
-                    updated_ingredients = []
-                    stock_logs = []
-
-                    for ingredient_id, restore_qty in ingredient_restore.items():
-                        ingredient = ingredients.get(ingredient_id)
-                        if ingredient is None:
-                            return Response(
-                                {"error": "Ingredient not found for stock reversal"},
-                                status=400,
-                            )
-                        ingredient.current_stock += restore_qty
-                        updated_ingredients.append(ingredient)
-                        stock_logs.append(
-                            StockLog(
-                                ingredient=ingredient,
-                                change=restore_qty,
-                                reason="ADJUSTMENT",
-                                user=log_user,
-                            )
-                        )
-
-                    Ingredient.objects.bulk_update(updated_ingredients, ["current_stock"])
-                    StockLog.objects.bulk_create(stock_logs)
+                    reverse_consumed_ingredients(
+                        ingredient_usage=ingredient_restore,
+                        db_alias=order._state.db or "default",
+                        user=log_user,
+                        operation_date=timezone.localdate(),
+                    )
 
                 order.payment_status = "REFUNDED"
 
@@ -684,6 +854,7 @@ class OrderPaymentView(APIView):
         reference = (request.data.get("reference") or "").strip()
         cash_received_raw = request.data.get("cash_received")
         request_is_offline = bool(getattr(request, "is_offline", not is_neon_reachable(force=False)))
+        db_alias = "sqlite" if request_is_offline else "neon"
 
         # -------------------------
         # Validate Method
@@ -699,17 +870,39 @@ class OrderPaymentView(APIView):
         # -------------------------
         try:
             order = (
-                Order.objects
+                Order.objects.using(db_alias)
                 .select_related("table", "session")
                 .prefetch_related(
                     Prefetch(
                         "items",
-                        queryset=OrderItem.objects.select_related("product", "combo").prefetch_related("combo__items__product"),
+                        queryset=OrderItem.objects.using(db_alias).select_related("product", "combo").prefetch_related("combo__items__product"),
                     )
                 )
                 .get(pk=pk)
             )
 
+        except (OperationalError, InterfaceError, DatabaseError):
+            # Connectivity can drop mid-session. Retry against local SQLite so
+            # billing remains usable and can sync later.
+            request_is_offline = True
+            db_alias = "sqlite"
+            try:
+                order = (
+                    Order.objects.using(db_alias)
+                    .select_related("table", "session")
+                    .prefetch_related(
+                        Prefetch(
+                            "items",
+                            queryset=OrderItem.objects.using(db_alias).select_related("product", "combo").prefetch_related("combo__items__product"),
+                        )
+                    )
+                    .get(pk=pk)
+                )
+            except Order.DoesNotExist:
+                return Response(
+                    {"error": "Order not found"},
+                    status=404
+                )
         except Order.DoesNotExist:
             return Response(
                 {"error": "Order not found"},
@@ -724,26 +917,31 @@ class OrderPaymentView(APIView):
                 {"error": "Already paid"},
                 status=400
             )
+        if not order.items.exists():
+            return Response({"error": "Cannot process payment for empty order"}, status=400)
 
         log_user = request.user if request.user.is_authenticated else None
         try:
-            with transaction.atomic():
+            with transaction.atomic(using=db_alias):
 
                 # -------------------------
-                # Use Saved Total
+                # Resolve Payable Amount
                 # -------------------------
-                total = order.total_amount
-            
+                stored_total = quantize_money(order.total_amount or Decimal("0.00"))
+                computed_subtotal = sum(
+                    ((item.price_at_time or Decimal("0.00")) * item.quantity for item in order.items.all()),
+                    Decimal("0.00"),
+                )
+                computed_payable = calculate_payable_amount(
+                    computed_subtotal,
+                    order.discount_amount or Decimal("0.00"),
+                )
 
-            # -------------------------
-            # Final Amount
-            # -------------------------
-                discount = order.discount_amount or Decimal("0.00")
-
-                final_amount = total - discount
-
-                if final_amount < 0:
-                    final_amount = Decimal("0.00")
+                # Legacy rows may still store pre-discount values in total_amount.
+                final_amount = computed_payable
+                if stored_total != computed_payable:
+                    order.total_amount = computed_payable
+                    order.save(using=db_alias, update_fields=["total_amount"])
 
                 if method == "CASH":
                     try:
@@ -755,7 +953,7 @@ class OrderPaymentView(APIView):
                             {"error": "Cash received is less than payable amount"},
                             status=400,
                         )
-                    reference_id = f"CASH:{cash_received:.2f}"
+                    reference_id = f"CASH:{quantize_money(cash_received)}"
                 elif method == "CARD":
                     if not reference:
                         return Response({"error": "Card reference/number is required"}, status=400)
@@ -767,7 +965,7 @@ class OrderPaymentView(APIView):
             # -------------------------
             # Create Payment
             # -------------------------
-                Payment.objects.create(
+                Payment.objects.using(db_alias).create(
                     order=order,
                     method=method,
                     amount=final_amount,
@@ -780,7 +978,7 @@ class OrderPaymentView(APIView):
             # 000000000001 Format
             # -------------------------
                 last_order = (
-                    Order.objects
+                    Order.objects.using(db_alias)
                     .filter(bill_number__isnull=False)
                     .only("bill_number")
                     .order_by("-created_at")
@@ -812,12 +1010,17 @@ class OrderPaymentView(APIView):
                     if order.status in {"CANCELLED", "COMPLETED"}:
                         return Response({"error": "Order cannot be moved to kitchen after payment"}, status=400)
                     order.status = "NEW"
-                order.save(update_fields=["bill_number", "payment_status", "status"])
+                order.save(using=db_alias, update_fields=["bill_number", "payment_status", "status"])
 
             # -------------------------
             # Stock Deduction
             # -------------------------
-                order_items = list(order.items.all())
+                order_items = list(
+                    order.items.select_related("product", "combo").prefetch_related(
+                        "combo__items",
+                        "addons__addon__ingredient",
+                    )
+                )
                 product_ids = set()
 
                 for item in order_items:
@@ -830,7 +1033,7 @@ class OrderPaymentView(APIView):
                 recipes_by_product = defaultdict(list)
                 if product_ids:
                     recipes = (
-                        Recipe.objects
+                        Recipe.objects.using(db_alias)
                         .filter(product_id__in=product_ids)
                         .select_related("ingredient", "product")
                     )
@@ -858,35 +1061,15 @@ class OrderPaymentView(APIView):
                             for recipe in item_recipes:
                                 ingredient_usage[recipe.ingredient_id] += recipe.quantity * combined_qty
 
+                    _accumulate_addon_ingredient_usage(item, ingredient_usage)
+
                 if ingredient_usage:
-                    ingredients = {
-                        ingredient.id: ingredient
-                        for ingredient in Ingredient.objects.select_for_update().filter(id__in=ingredient_usage.keys())
-                    }
-                    updated_ingredients = []
-                    stock_logs = []
-
-                    for ingredient_id, used_qty in ingredient_usage.items():
-                        ingredient = ingredients.get(ingredient_id)
-                        if ingredient is None:
-                            raise ValidationError("Ingredient not found for stock deduction")
-
-                        if ingredient.current_stock < used_qty:
-                            raise ValidationError(f"Not enough stock for {ingredient.name}")
-
-                        ingredient.current_stock -= used_qty
-                        updated_ingredients.append(ingredient)
-                        stock_logs.append(
-                            StockLog(
-                                ingredient=ingredient,
-                                change=-used_qty,
-                                reason="SALE",
-                                user=log_user
-                            )
-                        )
-
-                    Ingredient.objects.bulk_update(updated_ingredients, ["current_stock"])
-                    StockLog.objects.bulk_create(stock_logs)
+                    consume_ingredients_for_sale(
+                        ingredient_usage=ingredient_usage,
+                        db_alias=db_alias,
+                        user=log_user,
+                        operation_date=timezone.localdate(),
+                    )
 
             # -------------------------
             # Close Session + Free Table
@@ -895,20 +1078,21 @@ class OrderPaymentView(APIView):
 
                     order.session.is_active = False
                     order.session.closed_at = timezone.now()
-                    order.session.save(update_fields=["is_active", "closed_at"])
+                    order.session.save(using=db_alias, update_fields=["is_active", "closed_at"])
 
                     table = order.session.table
                     table.status = "AVAILABLE"
-                    table.save(update_fields=["status"])
+                    table.save(using=db_alias, update_fields=["status"])
 
             # Fire and forget: payment must not fail if WhatsApp send fails.
                 transaction.on_commit(
                     lambda: send_order_invoice_whatsapp(
                         order=order,
                         bill_number=bill_no,
-                        final_amount=f"{final_amount:.2f}",
+                        final_amount=str(quantize_money(final_amount)),
                         method=method,
-                    )
+                    ),
+                    using=db_alias,
                 )
                 if request_is_offline:
                     transaction.on_commit(
@@ -916,9 +1100,10 @@ class OrderPaymentView(APIView):
                             order=order,
                             method=method,
                             reference_id=reference_id,
-                        )
+                        ),
+                        using=db_alias,
                     )
-                transaction.on_commit(_refresh_sqlite_order_cache)
+                transaction.on_commit(_refresh_sqlite_order_cache, using=db_alias)
         except ValidationError as exc:
             detail = getattr(exc, "detail", exc)
             if isinstance(detail, (list, tuple)) and detail:
@@ -935,11 +1120,17 @@ class OrderPaymentView(APIView):
 
         return Response(
             {
-                "message": "Payment successful",
+                "message": (
+                    "Payment saved locally and queued for sync"
+                    if request_is_offline
+                    else "Payment completed successfully"
+                ),
                 "bill_number": bill_no,
-                "final_amount": final_amount,
+                "final_amount": quantize_money(final_amount),
                 "order_status": order.status,
                 "payment_status": order.payment_status,
+                "offline_saved": bool(request_is_offline),
+                "sync_state": "PENDING_SYNC" if request_is_offline else "SYNCED",
             },
             status=200
         )
@@ -1081,7 +1272,7 @@ class OrderInvoiceView(APIView):
                 "total_discount": order.discount_amount or Decimal("0.00"),
             },
 
-            "final_amount": grand_total - (order.discount_amount or 0),
+            "final_amount": quantize_money(order.total_amount or (grand_total - (order.discount_amount or 0))),
 
             "payment_method": payment.method if payment else None,
 
@@ -1107,6 +1298,7 @@ class AddOrderItemsView(APIView):
             return error_response(
                 "Cannot modify items for paid/completed/cancelled order",
                 400,
+                {"code": "ORDER_LOCKED"},
             )
 
         items = request.data.get("items", [])
@@ -1262,7 +1454,11 @@ class AddOrderItemsView(APIView):
                     selected_addons.append({"addon": addon_obj, "quantity": addon_qty})
                     addon_total += addon_obj.price * addon_qty
 
-                base_price = product.price + addon_total
+                amounts = calculate_line_amounts(
+                    menu_price=product.price,
+                    gst_percent=product.gst_percent or Decimal("0.00"),
+                    addon_total=addon_total,
+                )
                 gst_percent = product.gst_percent or Decimal("0.00")
             else:
                 combo = combos_map.get(item["combo_id"])
@@ -1272,12 +1468,16 @@ class AddOrderItemsView(APIView):
                         400,
                         {"item_index": item["item_index"], "combo": item["combo_id"]},
                     )
-                base_price = combo.price
+                amounts = calculate_line_amounts(
+                    menu_price=combo.price,
+                    gst_percent=combo.gst_percent or Decimal("0.00"),
+                    addon_total=Decimal("0.00"),
+                )
                 gst_percent = combo.gst_percent or Decimal("0.00")
 
-            taxable_base = product.price if product else base_price
-            gst_amount = (taxable_base * gst_percent) / 100
-            final_price = base_price + gst_amount
+            base_price = amounts["base_price"]
+            gst_amount = amounts["gst_amount"]
+            final_price = amounts["unit_total"]
 
             prepared_order_items.append(
                 {
@@ -1309,7 +1509,7 @@ class AddOrderItemsView(APIView):
             if coupon_obj.max_uses is not None and coupon_obj.usage_records.count() >= coupon_obj.max_uses:
                 return error_response("Coupon max usage limit reached", 400, {"field": "coupon_code"})
             if coupon_obj.first_time_only:
-                customer_phone = str(order.customer_phone or "").strip()
+                customer_phone = normalize_phone(order.customer_phone)
                 if not customer_phone:
                     return error_response(
                         "Customer phone required for first-time-only coupon",
@@ -1367,6 +1567,7 @@ class AddOrderItemsView(APIView):
         total_discount_amount = discount_amount + coupon_discount_amount
         if total_discount_amount > total:
             return error_response("Total discount cannot exceed order total", 400)
+        payable_amount = calculate_payable_amount(total, total_discount_amount)
 
         with transaction.atomic():
             order.items.all().delete()
@@ -1397,8 +1598,8 @@ class AddOrderItemsView(APIView):
                     if addon_rows:
                         OrderItemAddon.objects.bulk_create(addon_rows)
 
-            order.total_amount = total
-            order.discount_amount = total_discount_amount
+            order.total_amount = payable_amount
+            order.discount_amount = quantize_money(total_discount_amount)
             order.save(update_fields=["total_amount", "discount_amount"])
 
             if coupon_obj:
@@ -1418,11 +1619,12 @@ class AddOrderItemsView(APIView):
         return Response(
             {
                 "message": "Items added successfully",
-                "subtotal_with_gst": total,
-                "manual_discount_amount": discount_amount,
-                "coupon_discount_amount": coupon_discount_amount,
-                "discount_amount": total_discount_amount,
-                "payable_amount": total - total_discount_amount,
+                "subtotal_with_gst": quantize_money(total),
+                "manual_discount_amount": quantize_money(discount_amount),
+                "coupon_discount_amount": quantize_money(coupon_discount_amount),
+                "discount_amount": quantize_money(total_discount_amount),
+                "payable_amount": quantize_money(payable_amount),
+                "order_total": quantize_money(payable_amount),
                 "items_count": len(prepared_order_items),
             },
             status=200
@@ -1447,8 +1649,10 @@ class OrderCreateView(APIView):
         table_id = request.data.get("table")
         session_id = request.data.get("session")
 
-        customer_name = request.data.get("customer_name")
-        customer_phone = request.data.get("customer_phone")
+        customer_name = (request.data.get("customer_name") or "").strip()
+        customer_phone = normalize_phone(request.data.get("customer_phone"))
+        request_is_offline = bool(getattr(request, "is_offline", not is_neon_reachable(force=False)))
+        db_alias = "sqlite" if request_is_offline else "neon"
 
         session = None
         customer = None
@@ -1462,22 +1666,27 @@ class OrderCreateView(APIView):
                 return error_response("Session required for dine-in", 400)
 
             try:
-                session = TableSession.objects.get(id=session_id)
+                session = TableSession.objects.using(db_alias).get(id=session_id)
             except TableSession.DoesNotExist:
                 return error_response("Invalid session", 400)
 
             # Get / Create customer from session
             if session.customer_phone:
+                customer_phone = normalize_phone(session.customer_phone)
+                if not customer_phone:
+                    return error_response("Session has invalid customer phone", 400)
 
-                customer, _ = Customer.objects.get_or_create(
-                    phone=session.customer_phone,
+                customer, created = Customer.objects.using(db_alias).get_or_create(
+                    phone=customer_phone,
                     defaults={
-                        "name": session.customer_name
+                        "name": (session.customer_name or "Customer").strip() or "Customer"
                     }
                 )
+                if request_is_offline and created:
+                    _enqueue_offline_customer_create(customer)
 
-                customer_name = session.customer_name
-                customer_phone = session.customer_phone
+                customer_name = customer.name
+                customer_phone = customer.phone
 
 
         # -------------------------
@@ -1485,21 +1694,33 @@ class OrderCreateView(APIView):
         # -------------------------
         elif order_type == "TAKEAWAY":
 
-            if not customer_name or not customer_phone:
-                return Response(
-                    {
-                        "error": "Customer name and phone required for takeaway"
-                    },
-                    status=400
-                )
+            if not customer_phone:
+                return error_response("Valid 10-digit customer phone is required for takeaway", 400)
 
-            # Save / Get customer
-            customer, _ = Customer.objects.get_or_create(
-                phone=customer_phone,
-                defaults={
-                    "name": customer_name
-                }
-            )
+            aliases = [db_alias]
+            if db_alias != "sqlite":
+                aliases.append("sqlite")
+            customer, _ = _find_customer_by_phone(customer_phone, aliases=aliases)
+            if customer is None:
+                if not customer_name:
+                    return error_response(
+                        "Customer not found for this phone. Name is required to create a new customer.",
+                        400,
+                        {"code": "CUSTOMER_NAME_REQUIRED"},
+                    )
+                customer, created = Customer.objects.using(db_alias).get_or_create(
+                    phone=customer_phone,
+                    defaults={"name": customer_name},
+                )
+                if request_is_offline and created:
+                    _enqueue_offline_customer_create(customer)
+            elif customer._state.db != db_alias:
+                customer, _ = Customer.objects.using(db_alias).get_or_create(
+                    phone=customer_phone,
+                    defaults={"name": customer.name or customer_name or "Customer"},
+                )
+            customer_name = customer.name
+            customer_phone = customer.phone
 
         # -------------------------
         # SWIGGY / ZOMATO FLOW
@@ -1507,10 +1728,12 @@ class OrderCreateView(APIView):
         elif order_type in {"SWIGGY", "ZOMATO"}:
             customer_name = customer_name or order_type.title()
             if customer_phone:
-                customer, _ = Customer.objects.get_or_create(
+                customer, _ = Customer.objects.using(db_alias).get_or_create(
                     phone=customer_phone,
                     defaults={"name": customer_name},
                 )
+                if request_is_offline:
+                    _enqueue_offline_customer_create(customer)
 
         else:
             return error_response("Invalid order type", 400)
@@ -1526,7 +1749,7 @@ class OrderCreateView(APIView):
             else:
                 resolved_table_id = table_id
 
-        order = Order.objects.create(
+        order = Order.objects.using(db_alias).create(
 
             order_type=order_type,
 
@@ -1547,7 +1770,12 @@ class OrderCreateView(APIView):
         return Response(
             {
                 "id": order.id,
-                "order_id": format_order_id(order.order_number)
+                "order_id": format_order_id(order.order_number),
+                "customer": {
+                    "id": str(customer.id) if customer else None,
+                    "name": customer_name or "",
+                    "phone": customer_phone or "",
+                },
             },
             status=201
         )
@@ -1567,6 +1795,149 @@ class OrderListView(generics.ListAPIView):
         )
         return apply_order_filters(self.request, qs)
 
+    def list(self, request, *args, **kwargs):
+        orders = list(self.get_queryset())
+        request_is_offline = bool(getattr(request, "is_offline", not is_neon_reachable(force=False)))
+
+        filter_key = (request.GET.get("filter") or "").strip().lower()
+        payment_param = (request.GET.get("payment_status") or "").strip().upper()
+        can_merge_pending_paid = (
+            filter_key not in {"pending", "cancelled", "finished"}
+            and (not payment_param or "PAID" in {p.strip() for p in payment_param.split(",") if p.strip()})
+        )
+        if not request_is_offline and can_merge_pending_paid:
+            pending_local = _pending_local_paid_orders_for_user(request.user, limit=200)
+            merged_by_id = {str(order.id): order for order in orders}
+            for local_order in pending_local:
+                merged_by_id.setdefault(str(local_order.id), local_order)
+            orders = sorted(merged_by_id.values(), key=lambda o: o.created_at, reverse=True)
+
+        serializer = self.get_serializer(orders, many=True)
+        return Response(serializer.data)
+
+
+class CustomerPhoneLookupView(APIView):
+    permission_classes = [IsAdminOrStaff]
+
+    def get(self, request):
+        normalized_phone = normalize_phone(request.GET.get("phone"))
+        if not normalized_phone:
+            return Response([], status=200)
+
+        try:
+            limit = int(request.GET.get("limit", 8))
+        except (TypeError, ValueError):
+            limit = 8
+        limit = max(1, min(limit, 20))
+
+        request_is_offline = bool(getattr(request, "is_offline", not is_neon_reachable(force=False)))
+        primary_alias = "sqlite" if request_is_offline else "neon"
+        aliases = [primary_alias]
+        if primary_alias != "sqlite":
+            aliases.append("sqlite")
+
+        candidates = []
+        seen_phones = set()
+        for alias in aliases:
+            qs = (
+                Customer.objects.using(alias)
+                .filter(phone__isnull=False)
+                .exclude(phone="")
+            )
+            rows = list(
+                qs.filter(phone__icontains=normalized_phone)
+                .order_by("-created_at")[: max(limit * 3, 12)]
+            )
+            for row in rows:
+                phone = normalize_phone(row.phone)
+                if not phone or phone in seen_phones:
+                    continue
+                seen_phones.add(phone)
+                candidates.append(row)
+
+        candidates.sort(
+            key=lambda customer: (
+                not normalize_phone(customer.phone).endswith(normalized_phone),
+                str(customer.name or "").lower(),
+            )
+        )
+
+        payload = [
+            {
+                "id": str(customer.id),
+                "name": customer.name or "",
+                "phone": normalize_phone(customer.phone),
+            }
+            for customer in candidates[:limit]
+        ]
+        return Response(payload, status=200)
+
+
+class TakeawayCustomerResolveView(APIView):
+    permission_classes = [IsAdminOrStaff]
+
+    def post(self, request):
+        phone = normalize_phone(request.data.get("phone") or request.data.get("customer_phone"))
+        name = (request.data.get("name") or request.data.get("customer_name") or "").strip()
+        if not phone:
+            return error_response("Valid 10-digit phone is required", 400, {"field": "phone"})
+
+        request_is_offline = bool(getattr(request, "is_offline", not is_neon_reachable(force=False)))
+        primary_alias = "sqlite" if request_is_offline else "neon"
+        aliases = [primary_alias]
+        if primary_alias != "sqlite":
+            aliases.append("sqlite")
+
+        customer, customer_alias = _find_customer_by_phone(phone, aliases=aliases)
+        if customer:
+            return Response(
+                {
+                    "status": "existing",
+                    "requires_name": False,
+                    "customer": {
+                        "id": str(customer.id),
+                        "name": customer.name or "",
+                        "phone": normalize_phone(customer.phone),
+                    },
+                    "source_db": customer_alias,
+                    "sync_pending": customer_alias == "sqlite" and not request_is_offline,
+                },
+                status=200,
+            )
+
+        if not name:
+            return Response(
+                {
+                    "status": "not_found",
+                    "requires_name": True,
+                    "customer": None,
+                    "phone": phone,
+                },
+                status=200,
+            )
+
+        customer, created = Customer.objects.using(primary_alias).get_or_create(
+            phone=phone,
+            defaults={"name": name},
+        )
+        if request_is_offline:
+            _enqueue_offline_customer_create(customer)
+
+        return Response(
+            {
+                "status": "created" if created else "existing",
+                "requires_name": False,
+                "customer": {
+                    "id": str(customer.id),
+                    "name": customer.name or "",
+                    "phone": normalize_phone(customer.phone),
+                },
+                "source_db": primary_alias,
+                "sync_pending": bool(request_is_offline),
+            },
+            status=201 if created else 200,
+        )
+
 
 class RecentOrderListView(APIView):
 
@@ -1580,6 +1951,7 @@ class RecentOrderListView(APIView):
             limit = 10
 
         limit = max(1, min(limit, 100))
+        request_is_offline = bool(getattr(request, "is_offline", not is_neon_reachable(force=False)))
 
         qs = (
             Order.objects
@@ -1592,7 +1964,24 @@ class RecentOrderListView(APIView):
             qs = qs.filter(staff=request.user)
 
         qs = apply_order_filters(request, qs)
-        orders = qs[:limit]
+        orders = list(qs[:limit])
+
+        filter_key = (request.GET.get("filter") or "").strip().lower()
+        payment_param = (request.GET.get("payment_status") or "").strip().upper()
+        can_merge_pending_paid = (
+            filter_key not in {"pending", "cancelled", "finished"}
+            and (not payment_param or "PAID" in {p.strip() for p in payment_param.split(",") if p.strip()})
+        )
+        if not request_is_offline and can_merge_pending_paid:
+            pending_local = _pending_local_paid_orders_for_user(request.user, limit=limit)
+            merged_by_id = {str(order.id): order for order in orders}
+            for local_order in pending_local:
+                merged_by_id.setdefault(str(local_order.id), local_order)
+            orders = sorted(
+                merged_by_id.values(),
+                key=lambda o: o.created_at,
+                reverse=True,
+            )[:limit]
 
         data = []
         for order in orders:
@@ -1600,14 +1989,8 @@ class RecentOrderListView(APIView):
             if not customer_name and order.customer:
                 customer_name = order.customer.name
 
-            if order.payment_status == "PAID":
-                display_status = "PAID"
-            elif order.payment_status == "REFUNDED":
-                display_status = "REFUNDED"
-            elif order.status == "CANCELLED":
-                display_status = "CANCELLED"
-            else:
-                display_status = "PENDING"
+            display_status = _resolve_order_display_status(order)
+            sync_pending = (order._state.db == "sqlite" and not request_is_offline)
 
             data.append({
                 "id": str(order.id),
@@ -1621,7 +2004,8 @@ class RecentOrderListView(APIView):
                 "status": display_status,
                 "order_status": order.status,
                 "payment_status": order.payment_status,
-                "created_at": order.created_at
+                "created_at": order.created_at,
+                "sync_pending": sync_pending,
             })
 
         return Response(data)

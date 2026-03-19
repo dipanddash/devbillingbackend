@@ -14,6 +14,10 @@ _cache = {"online": None, "checked_at": 0}
 CACHE_TTL = 15  # seconds
 
 
+def mark_neon_unreachable():
+    _cache.update({"online": False, "checked_at": time.time()})
+
+
 def _probe_neon_database():
     """
     Verify Neon with a real SQL round-trip instead of only a TCP socket probe.

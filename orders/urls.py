@@ -1,5 +1,5 @@
 from django.urls import path
-from .views import AddOrderItemsView, OrderCreateView, OrderInvoiceView, OrderStatusUpdateView, TodayOrderListView, OrderListView, RecentOrderListView, send_whatsapp
+from .views import AddOrderItemsView, OrderCreateView, OrderInvoiceView, OrderStatusUpdateView, TodayOrderListView, OrderListView, RecentOrderListView, CustomerPhoneLookupView, TakeawayCustomerResolveView, send_whatsapp
 from .views import OrderPaymentView
 from .views import OrderDetailView
 from .views import OrderCancelView
@@ -9,6 +9,8 @@ urlpatterns = [
     path("create/", OrderCreateView.as_view()),
     path("today/", TodayOrderListView.as_view()),
     path("recent/", RecentOrderListView.as_view()),
+    path("customer-lookup/", CustomerPhoneLookupView.as_view()),
+    path("takeaway-customer/resolve/", TakeawayCustomerResolveView.as_view()),
     path("status/<uuid:pk>/", OrderStatusUpdateView.as_view()),
     path("cancel/<uuid:pk>/", OrderCancelView.as_view()),
     path("pay/<uuid:pk>/", OrderPaymentView.as_view()),

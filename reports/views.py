@@ -1,5 +1,6 @@
 from collections import defaultdict
 from decimal import Decimal
+import uuid as uuid_mod
 
 from django.db.models import Count, F, Max, Min, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce, ExtractHour, TruncDate
@@ -16,6 +17,8 @@ from orders.serializers import CouponUsageSerializer
 from orders.utils import format_bill_number, format_order_id
 from payments.models import Payment
 from products.models import ComboItem, Product, Recipe
+from sync.models import OfflineSyncQueue
+from cafe_billing_backend.connectivity import is_neon_reachable
 
 
 def _as_date(value):
@@ -104,6 +107,38 @@ def _payload(request, report_name, summary=None, data=None, product_breakdown=No
             "product_breakdown": product_breakdown or [],
         }
     )
+
+
+def _offline_order_client_id(order_id):
+    return uuid_mod.uuid5(uuid_mod.NAMESPACE_URL, f"offline-order:{order_id}")
+
+
+def _pending_local_paid_orders_for_user(user, target_date):
+    pending_client_ids = {
+        str(client_id)
+        for client_id in (
+            OfflineSyncQueue.objects.using("sqlite")
+            .filter(entity_type="order", action="create", status__in=("PENDING", "IN_PROGRESS", "FAILED"))
+            .values_list("client_id", flat=True)
+        )
+    }
+    if not pending_client_ids:
+        return []
+
+    qs = (
+        Order.objects.using("sqlite")
+        .exclude(status="CANCELLED")
+        .filter(payment_status="PAID", created_at__date=target_date)
+        .order_by("-created_at")
+    )
+    if (getattr(user, "role", "") or "").upper() == "STAFF":
+        qs = qs.filter(staff_id=user.id)
+
+    rows = []
+    for order in qs:
+        if str(_offline_order_client_id(order.id)) in pending_client_ids:
+            rows.append(order)
+    return rows
 
 
 def _report_daily_sales(request):
@@ -432,22 +467,30 @@ def _report_stock(request):
     start, end = _resolve_date_range(request)
     start = start or timezone.localdate()
     end = end or timezone.localdate()
-    latest_cost = PurchaseItem.objects.filter(ingredient=OuterRef("pk")).order_by("-invoice__created_at").values("unit_price")[:1]
-    ingredients = Ingredient.objects.annotate(cost=Coalesce(Subquery(latest_cost), Value(Decimal("0.00")))).order_by("name")
-    before = StockLog.objects.filter(created_at__date__lt=start).values("ingredient_id").annotate(opening=Coalesce(Sum("change"), Decimal("0.000")))
-    before_map = {str(r["ingredient_id"]): r["opening"] for r in before}
+    ingredients = Ingredient.objects.order_by("name")
     rng = StockLog.objects.filter(created_at__date__range=[start, end]).values("ingredient_id").annotate(
         stock_in=Coalesce(Sum("change", filter=Q(change__gt=0)), Decimal("0.000")),
         stock_out=Coalesce(Sum(-F("change"), filter=Q(change__lt=0)), Decimal("0.000")),
         net=Coalesce(Sum("change"), Decimal("0.000")),
     )
     rng_map = {str(r["ingredient_id"]): r for r in rng}
+    future = (
+        StockLog.objects.filter(created_at__date__gt=end)
+        .values("ingredient_id")
+        .annotate(net=Coalesce(Sum("change"), Decimal("0.000")))
+    )
+    future_map = {str(r["ingredient_id"]): r["net"] for r in future}
     data = []
     for ing in ingredients:
         key = str(ing.id)
-        opening = before_map.get(key, Decimal("0.000"))
         row = rng_map.get(key, {})
-        closing = opening + row.get("net", Decimal("0.000"))
+        current_stock = ing.current_stock or Decimal("0.000")
+        net_after_end = future_map.get(key, Decimal("0.000"))
+
+        # Anchor to current stock so reports stay correct even when some
+        # historical opening/manual adjustments were saved without StockLog rows.
+        closing = current_stock - net_after_end
+        opening = closing - row.get("net", Decimal("0.000"))
         data.append({
             "product_name": ing.name,
             "opening_stock": opening,
@@ -455,7 +498,7 @@ def _report_stock(request):
             "stock_out": row.get("stock_out", Decimal("0.000")),
             "closing_stock": closing,
             "unit": ing.unit,
-            "stock_value": closing * (ing.cost or Decimal("0.00")),
+            "stock_value": closing * (ing.unit_price or Decimal("0.00")),
         })
     return [{"rows": len(data)}], data, []
 
@@ -595,7 +638,7 @@ def _report_ingredient(request):
     flt = _filters(request)
     latest_purchase = PurchaseItem.objects.filter(ingredient=OuterRef("pk")).order_by("-invoice__created_at")
     ingredients = Ingredient.objects.annotate(
-        cost_per_unit=Coalesce(Subquery(latest_purchase.values("unit_price")[:1]), Value(Decimal("0.00"))),
+        cost_per_unit=Coalesce(F("unit_price"), Value(Decimal("0.00"))),
         supplier_name=Coalesce(Subquery(latest_purchase.values("invoice__vendor__name")[:1]), Value("-")),
         category_name=Coalesce(Subquery(latest_purchase.values("invoice__vendor__category")[:1]), Value("-")),
     ).order_by("name")
@@ -623,10 +666,9 @@ def _report_ingredient(request):
 
 def _report_menu(request):
     flt = _filters(request)
-    latest_cost = PurchaseItem.objects.filter(ingredient=OuterRef("pk")).order_by("-invoice__created_at").values("unit_price")[:1]
     ingredient_cost_map = {
-        str(r["id"]): (r["cost"] or Decimal("0.00"))
-        for r in Ingredient.objects.annotate(cost=Coalesce(Subquery(latest_cost), Value(Decimal("0.00")))).values("id", "cost")
+        str(r["id"]): (r["unit_price"] or Decimal("0.00"))
+        for r in Ingredient.objects.values("id", "unit_price")
     }
 
     products = Product.objects.select_related("category").prefetch_related("recipes__ingredient").order_by("name")
@@ -897,8 +939,22 @@ class DashboardSummaryView(APIView):
         today = timezone.localdate()
         qs = _order_qs(request).filter(created_at__date=today)
         paid_or_completed = qs.filter(Q(payment_status="PAID") | Q(status="COMPLETED")).exclude(status="CANCELLED")
-        sales = paid_or_completed.aggregate(v=Coalesce(Sum("total_amount"), Decimal("0.00")))["v"]
-        metrics = [{"metric": "Total Sales", "value": sales}, {"metric": "Total Orders", "value": paid_or_completed.count()}]
+        sales = paid_or_completed.aggregate(v=Coalesce(Sum("total_amount"), Decimal("0.00")))["v"] or Decimal("0.00")
+        orders_count = paid_or_completed.count()
+
+        request_is_offline = bool(getattr(request, "is_offline", not is_neon_reachable(force=False)))
+        pending_local_orders = []
+        if not request_is_offline:
+            pending_local_orders = _pending_local_paid_orders_for_user(request.user, target_date=today)
+            pending_sales = sum((order.total_amount or Decimal("0.00") for order in pending_local_orders), Decimal("0.00"))
+            sales += pending_sales
+            orders_count += len(pending_local_orders)
+
+        metrics = [
+            {"metric": "Total Sales", "value": sales},
+            {"metric": "Total Orders", "value": orders_count},
+            {"metric": "Pending Local Orders", "value": len(pending_local_orders)},
+        ]
         return _payload(request, "Dashboard Summary", summary=metrics, data=metrics)
 
 

@@ -56,6 +56,14 @@ class Addon(models.Model):
 
     name = models.CharField(max_length=150)
     price = models.DecimalField(max_digits=8, decimal_places=2)
+    ingredient = models.ForeignKey(
+        "inventory.Ingredient",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="product_addons",
+    )
+    ingredient_quantity = models.DecimalField(max_digits=10, decimal_places=3, default=0)
 
     image = models.ImageField(
         upload_to="addons/",
